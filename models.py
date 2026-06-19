@@ -25,6 +25,48 @@ def decode_datetime(dct):
 
 
 @dataclass
+class Group:
+    """微信群/QQ群：保存常用群配置，多群发车时快速切换"""
+    id: str
+    name: str  # 群名，如 "硬核推理老玩家群"
+    alias: str = ""  # 简称，命令中使用，如 "硬核群"、"A群"
+    default_group: bool = False  # 默认群（new/copy 时默认选中）
+    publish_style: str = "formal"  # 文案口吻：formal(正式) / casual(轻松) / hardcore(硬核) / friendly(友好)
+    default_city: str = ""
+    default_shop: str = ""
+    # 文案偏好
+    emphasize_barrier: bool = False  # 强调门槛（老玩家群）
+    emphasize_friendly: bool = False  # 强调可带新（萌新群）
+    emphasize_venue: bool = False  # 强调时间地点（店铺群）
+    footer_note: str = ""  # 群专属文案，如 "请先看群规再报名"
+    created_at: datetime = field(default_factory=datetime.now)
+
+    @classmethod
+    def create(cls, name, alias="", default_group=False, publish_style="formal",
+               default_city="", default_shop="",
+               emphasize_barrier=False, emphasize_friendly=False, emphasize_venue=False,
+               footer_note=""):
+        return cls(
+            id=str(uuid.uuid4())[:8],
+            name=name,
+            alias=alias,
+            default_group=bool(default_group),
+            publish_style=publish_style,
+            default_city=default_city,
+            default_shop=default_shop,
+            emphasize_barrier=bool(emphasize_barrier),
+            emphasize_friendly=bool(emphasize_friendly),
+            emphasize_venue=bool(emphasize_venue),
+            footer_note=footer_note,
+        )
+
+    def display_name(self) -> str:
+        if self.alias:
+            return f"{self.alias}（{self.name}）"
+        return self.name
+
+
+@dataclass
 class CarTemplate:
     """车队模板：保存常用配置以便快速套用"""
     id: str
@@ -69,11 +111,12 @@ class Car:
     created_at: datetime = field(default_factory=datetime.now)
     status: str = "open"
     template_id: Optional[str] = None
+    target_group: Optional[str] = None  # ✅ v1.3: 归属群ID/简称，copy后持久化
 
     @classmethod
     def create(cls, name, total_players, duration_hours, city, shop,
                start_time, role_constraints="", require_unread=False,
-               min_experience=0, template_id=None):
+               min_experience=0, template_id=None, target_group=None):
         return cls(
             id=str(uuid.uuid4())[:8],
             name=name,
@@ -86,11 +129,12 @@ class Car:
             require_unread=bool(require_unread),
             min_experience=int(min_experience),
             template_id=template_id,
+            target_group=target_group,
         )
 
     def copy(self, name=None, start_time=None, city=None, shop=None,
              total_players=None, duration_hours=None, role_constraints=None,
-             require_unread=None, min_experience=None) -> "Car":
+             require_unread=None, min_experience=None, target_group=None) -> "Car":
         """从已有车复制出新车，可选择性覆盖字段，报名记录不复制"""
         return Car.create(
             name=name if name is not None else self.name,
@@ -103,6 +147,7 @@ class Car:
             require_unread=require_unread if require_unread is not None else self.require_unread,
             min_experience=min_experience if min_experience is not None else self.min_experience,
             template_id=self.template_id,
+            target_group=target_group if target_group is not None else self.target_group,
         )
 
 
@@ -167,10 +212,12 @@ class Registration:
     accept_crosscast_override: Optional[bool] = None  # None=使用玩家默认值
     status: str = "pending"
     created_at: datetime = field(default_factory=datetime.now)
+    source_group: Optional[str] = None  # ✅ v1.3: 来源群ID/简称，玩家从哪个群来的
 
     @classmethod
     def create(cls, car_id, player_id, available_time="随时",
-               read_this_book=False, notes="", accept_crosscast_override=None):
+               read_this_book=False, notes="", accept_crosscast_override=None,
+               source_group=None):
         return cls(
             id=str(uuid.uuid4())[:8],
             car_id=car_id,
@@ -179,6 +226,7 @@ class Registration:
             read_this_book=bool(read_this_book),
             notes=notes,
             accept_crosscast_override=accept_crosscast_override,
+            source_group=source_group,
         )
 
     def effective_accept_crosscast(self, player: Player) -> bool:
@@ -193,3 +241,4 @@ class Database:
     players: List[Player] = field(default_factory=list)
     registrations: List[Registration] = field(default_factory=list)
     templates: List[CarTemplate] = field(default_factory=list)
+    groups: List[Group] = field(default_factory=list)  # ✅ v1.3: 群管理列表

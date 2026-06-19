@@ -1,0 +1,36 @@
+{
+  "cars": [],
+  "players": [],
+  "registrations": [],
+  "templates": [],
+  "groups": [
+    {
+      "id": "3c027292",
+      "name": "硬核老玩家交流群",
+      "alias": "老玩家群",
+      "default_group": false,
+      "publish_style": "hardcore",
+      "default_city": "",
+      "default_shop": "",
+      "emphasize_barrier": true,
+      "emphasize_friendly": false,
+      "emphasize_venue": false,
+      "footer_note": "跳车请提前24小时告知",
+      "created_at": "2026-06-20T06:52:21.921503"
+    },
+    {
+      "id": "d84fc8a2",
+      "name": "萌新推理社",
+      "alias": "萌新群",
+      "default_group": false,
+      "publish_style": "friendly",
+      "default_city": "",
+      "default_shop": "",
+      "emphasize_barrier": false,
+      "emphasize_friendly": true,
+      "emphasize_venue": false,
+      "footer_note": "",
+      "created_at": "2026-06-20T06:52:21.923691"
+    }
+  ]
+}

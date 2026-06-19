@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-集成测试套件 v1.2 - 适配：
+集成测试套件 v1.3 - 适配：
   - 0经验允许
   - 模板功能
   - 玩家/报名字段拆分
@@ -10,6 +10,10 @@
   - 车队复制
   - 序号范围解析
   - 三种导出格式
+  - 群管理（v1.3）
+  - 来源群记录（v1.3）
+  - 跨群重复报名检测（v1.3）
+  - 多群 draft 生成（v1.3）
 """
 import sys
 import os
@@ -18,7 +22,7 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from models import Car, Player, Registration, CarTemplate
+from models import Car, Player, Registration, CarTemplate, Group
 from storage import (
     load_db, save_db,
     add_car, get_car, list_cars, update_car_status, delete_car,
@@ -26,12 +30,14 @@ from storage import (
     add_registration, remove_registration, get_registrations_by_car,
     add_template, get_template, list_templates, delete_template,
     add_player_tag, remove_player_tag, list_players_by_tag,
+    add_group, get_group, list_groups, delete_group, get_default_group,
     DB_FILE,
 )
 from matcher import (
     triage_registrations, analyze_match,
     check_time_match, check_gender_role_match, check_book_read_rule,
     check_experience, check_notes_conflict, check_player_tags,
+    check_double_booking,
     _parse_time_availability,
 )
 
@@ -167,8 +173,8 @@ def test_player_registration_split():
         print(f"  {'✓' if ok3 else '✗'} 车2本次反串覆盖玩家默认")
         print(f"  {'✓' if ok4 else '✗'} 车1使用玩家默认值")
 
-        mr1 = analyze_match(car1, r1, player)
-        mr2 = analyze_match(car2, r2, player)
+        mr1 = analyze_match(db, car1, r1, player)
+        mr2 = analyze_match(db, car2, r2, player)
         book_issue_1 = any("未读本" in str(i) for i in mr1.issues)
         book_issue_2 = any("未读本" in str(i) for i in mr2.issues)
         ok5 = book_issue_1 and not book_issue_2
@@ -346,7 +352,7 @@ def test_player_tags():
         print(f"  {'✓' if ok8 else '✗'} check_player_tags: 天眼风险→critical={has_critical}")
 
         # analyze_match 里正面标签应降低 severity_score
-        mr = analyze_match(car, reg3, p3)
+        mr = analyze_match(db, car, reg3, p3)
         has_good_bonus = any("靠谱" in str(i) for i in mr.issues) is False  # 正面标签不产生issue，但加分
         print(f"  {'✓' if has_good_bonus else '✗'} 正面标签不产生issue（加分通过severity_score）")
 
@@ -356,16 +362,24 @@ def test_player_tags():
 
 
 def test_car_copy():
-    """v1.2: 车队复制功能"""
-    sep("车队复制")
+    """v1.2+v1.3: 车队复制功能 + 群名持久化"""
+    sep("车队复制（含群名持久化）")
     backup = _clean_db()
     db = load_db()
     try:
+        # v1.3: 先建一个群
+        grp = Group.create(
+            name="硬核老玩家交流群", alias="老玩家群",
+            emphasize_barrier=True, publish_style="hardcore",
+        )
+        add_group(db, grp)
+
         original = Car.create(
             name="《立方馆谋杀始末》", total_players=6, duration_hours=5.0,
             city="上海", shop="硬核旗舰店",
             start_time=datetime.now() + timedelta(days=1),
             role_constraints="3男3女", require_unread=True, min_experience=3,
+            target_group=grp.id,  # v1.3: 原车归属群
         )
         add_car(db, original)
 
@@ -375,11 +389,17 @@ def test_car_copy():
         reg1 = Registration.create(original.id, p1.id, available_time="随时")
         add_registration(db, reg1)
 
-        # 复制车，只改时间和店铺
+        # 复制车，改时间、店铺、并指定新群
         new_time = datetime.now() + timedelta(days=8)
+        grp2 = Group.create(
+            name="萌新推理社", alias="萌新群",
+            emphasize_friendly=True, publish_style="friendly",
+        )
+        add_group(db, grp2)
         new_car = original.copy(
             start_time=new_time,
             shop="硬核分店",
+            target_group=grp2.id,  # v1.3: 新车归属新群
         )
         add_car(db, new_car)
 
@@ -395,6 +415,11 @@ def test_car_copy():
         ok9 = new_car.require_unread == original.require_unread
         ok10 = new_car.min_experience == original.min_experience
 
+        # v1.3: 验证群名持久化
+        ok13 = original.target_group == grp.id
+        ok14 = new_car.target_group == grp2.id
+        ok15 = new_car.target_group != original.target_group
+
         # 新车不应有报名
         new_regs = get_registrations_by_car(db, new_car.id)
         ok11 = len(new_regs) == 0
@@ -403,9 +428,10 @@ def test_car_copy():
         orig_regs = get_registrations_by_car(db, original.id)
         ok12 = len(orig_regs) == 1
 
-        checks = [ok1, ok2, ok3, ok4, ok5, ok6, ok7, ok8, ok9, ok10, ok11, ok12]
+        checks = [ok1, ok2, ok3, ok4, ok5, ok6, ok7, ok8, ok9, ok10, ok11, ok12, ok13, ok14, ok15]
         labels = ["新ID", "同名", "同人数", "同时长", "同城市", "新店铺", "新时间",
-                  "同角色配置", "同未读本要求", "同经验门槛", "新车无报名", "原车报名不变"]
+                  "同角色配置", "同未读本要求", "同经验门槛", "新车无报名", "原车报名不变",
+                  "原车群名持久化", "新车群名独立", "群名不互相影响"]
         for label, ok in zip(labels, checks):
             print(f"  {'✓' if ok else '✗'} {label}")
 
@@ -613,8 +639,302 @@ def test_full_workflow_v12():
         _restore_db(backup)
 
 
+def test_group_management():
+    """v1.3: 群管理 CRUD"""
+    sep("群管理 CRUD")
+    backup = _clean_db()
+    db = load_db()
+    try:
+        # 1. 建群
+        grp1 = Group.create(
+            name="硬核老玩家交流群", alias="老玩家群",
+            emphasize_barrier=True, publish_style="hardcore",
+            default_group=True, footer_note="跳车请提前24小时告知",
+        )
+        add_group(db, grp1)
+
+        grp2 = Group.create(
+            name="萌新推理社", alias="萌新群",
+            emphasize_friendly=True, publish_style="friendly",
+        )
+        add_group(db, grp2)
+        grp3 = Group.create(
+            name="剧本杀店铺会员群", alias="店铺群",
+            emphasize_venue=True, default_city="上海", default_shop="硬核旗舰店",
+        )
+        add_group(db, grp3)
+
+        ok1 = len(list_groups(db)) == 3
+        print(f"  {'✓' if ok1 else '✗'} 创建3个群")
+
+        # 2. 智能查找：按ID/简称/群名
+        g_by_id = get_group(db, grp1.id)
+        g_by_alias = get_group(db, "老玩家群")
+        g_by_name = get_group(db, "萌新推理社")
+        g_by_partial = get_group(db, "店铺")  # 模糊匹配
+        ok2 = g_by_id and g_by_id.alias == "老玩家群"
+        ok3 = g_by_alias and g_by_alias.id == grp1.id
+        ok4 = g_by_name and g_by_name.alias == "萌新群"
+        ok5 = g_by_partial and g_by_partial.alias == "店铺群"
+        print(f"  {'✓' if ok2 else '✗'} 按ID查找")
+        print(f"  {'✓' if ok3 else '✗'} 按简称查找")
+        print(f"  {'✓' if ok4 else '✗'} 按群名查找")
+        print(f"  {'✓' if ok5 else '✗'} 模糊查找")
+
+        # 3. 默认群
+        default_g = get_default_group(db)
+        ok6 = default_g and default_g.id == grp1.id
+        print(f"  {'✓' if ok6 else '✗'} 默认群: {default_g.name if default_g else 'None'}")
+
+        # 4. 设置新默认群，自动取消其他
+        grp2.default_group = True
+        add_group(db, grp2)  # 保存时应自动取消其他默认
+        default_g2 = get_default_group(db)
+        ok7 = default_g2 and default_g2.id == grp2.id
+        g1_refresh = get_group(db, grp1.id)
+        ok8 = g1_refresh.default_group is False
+        print(f"  {'✓' if ok7 else '✗'} 设新默认群")
+        print(f"  {'✓' if ok8 else '✗'} 旧默认群自动取消")
+
+        # 5. 删除群
+        delete_group(db, grp3.id)
+        ok9 = len(list_groups(db)) == 2
+        print(f"  {'✓' if ok9 else '✗'} 删除群")
+
+        # 6. 群排序：display_name
+        dn = grp1.display_name()
+        ok10 = "老玩家群" in dn and "硬核老玩家交流群" in dn
+        print(f"  {'✓' if ok10 else '✗'} display_name: {dn}")
+
+        return all([ok1, ok2, ok3, ok4, ok5, ok6, ok7, ok8, ok9, ok10])
+    finally:
+        _restore_db(backup)
+
+
+def test_source_group():
+    """v1.3: 来源群记录与显示"""
+    sep("来源群记录")
+    backup = _clean_db()
+    db = load_db()
+    try:
+        grp = Group.create(name="测试群", alias="测群")
+        add_group(db, grp)
+
+        car = Car.create(
+            name="《测试本》", total_players=6, duration_hours=5,
+            city="上海", shop="A店",
+            start_time=datetime.now() + timedelta(days=1),
+            target_group=grp.id,
+        )
+        add_car(db, car)
+
+        p = Player.create(nickname="测试玩家", gender="男", experience_count=3)
+        add_player(db, p)
+
+        # 报名时记录来源群
+        reg = Registration.create(
+            car.id, p.id, available_time="随时",
+            source_group=grp.id,
+        )
+        add_registration(db, reg)
+
+        # 验证持久化
+        regs = get_registrations_by_car(db, car.id)
+        ok1 = regs[0].source_group == grp.id
+        print(f"  {'✓' if ok1 else '✗'} 报名记录来源群")
+
+        # 车归属群
+        ok2 = car.target_group == grp.id
+        print(f"  {'✓' if ok2 else '✗'} 车记录归属群")
+
+        # 保存重载测试持久化
+        save_db(db)
+        db2 = load_db()
+        car2 = get_car(db2, car.id)
+        reg2 = get_registrations_by_car(db2, car.id)[0]
+        ok3 = car2.target_group == grp.id
+        ok4 = reg2.source_group == grp.id
+        print(f"  {'✓' if ok3 else '✗'} 保存后车归属群持久化")
+        print(f"  {'✓' if ok4 else '✗'} 保存后来源群持久化")
+
+        return all([ok1, ok2, ok3, ok4])
+    finally:
+        _restore_db(backup)
+
+
+def test_double_booking():
+    """v1.3: 跨群重复报名检测"""
+    sep("跨群重复报名检测")
+    backup = _clean_db()
+    db = load_db()
+    try:
+        grp1 = Group.create(name="群A", alias="A")
+        grp2 = Group.create(name="群B", alias="B")
+        add_group(db, grp1)
+        add_group(db, grp2)
+
+        now = datetime.now()
+        # 两车时间接近（3小时间隔，小于6小时阈值）
+        car1 = Car.create(
+            name="《车1》", total_players=6, duration_hours=5,
+            city="上海", shop="A店",
+            start_time=now + timedelta(days=1, hours=19),
+            target_group=grp1.id,
+        )
+        car2 = Car.create(
+            name="《车2》", total_players=6, duration_hours=5,
+            city="上海", shop="B店",
+            start_time=now + timedelta(days=1, hours=21),  # 与车1间隔2小时
+            target_group=grp2.id,
+        )
+        add_car(db, car1)
+        add_car(db, car2)
+
+        p = Player.create(nickname="时间管理大师", gender="男", experience_count=5)
+        add_player(db, p)
+
+        reg1 = Registration.create(car1.id, p.id, available_time="随时", source_group=grp1.id)
+        reg2 = Registration.create(car2.id, p.id, available_time="随时", source_group=grp2.id)
+        add_registration(db, reg1)
+        add_registration(db, reg2)
+
+        # 检测跨群重复报名
+        issues = check_double_booking(db, car2, reg2, p)
+        has_double = any("double_booking" in str(i) for i in issues)
+        ok1 = has_double
+        issue_str = str([str(i) for i in issues])
+        print(f"  {'✓' if ok1 else '✗'} 检测到跨群重复报名：{issue_str}")
+
+        # analyze_match 应该包含该问题
+        mr = analyze_match(db, car2, reg2, p)
+        ok2 = any("double_booking" in str(i) for i in mr.issues)
+        print(f"  {'✓' if ok2 else '✗'} analyze_match包含跨群检测")
+
+        # 两车时间间隔大（>6小时）不应触发
+        car3 = Car.create(
+            name="《车3》", total_players=6, duration_hours=5,
+            city="上海", shop="C店",
+            start_time=now + timedelta(days=3),
+            target_group=grp1.id,
+        )
+        add_car(db, car3)
+        reg3 = Registration.create(car3.id, p.id, available_time="随时", source_group=grp1.id)
+        add_registration(db, reg3)
+        issues2 = check_double_booking(db, car3, reg3, p)
+        ok3 = len(issues2) == 0
+        print(f"  {'✓' if ok3 else '✗'} 时间间隔足够时无警告")
+
+        return all([ok1, ok2, ok3])
+    finally:
+        _restore_db(backup)
+
+
+def test_multi_group_draft():
+    """v1.3: 多群 draft 生成不同版本文案"""
+    sep("多群 draft 生成")
+    backup = _clean_db()
+    db = load_db()
+    try:
+        from hardcore_car import _generate_draft_for_group
+
+        # 创建3个群
+        grp_hard = Group.create(
+            name="硬核老玩家群", alias="老玩家",
+            emphasize_barrier=True, publish_style="hardcore",
+        )
+        grp_new = Group.create(
+            name="萌新群", alias="萌新",
+            emphasize_friendly=True, publish_style="friendly",
+        )
+        grp_shop = Group.create(
+            name="店铺会员群", alias="店铺",
+            emphasize_venue=True, publish_style="casual",
+        )
+        add_group(db, grp_hard)
+        add_group(db, grp_new)
+        add_group(db, grp_shop)
+
+        car = Car.create(
+            name="《测试本》", total_players=6, duration_hours=5,
+            city="上海", shop="硬核旗舰店",
+            start_time=datetime.now() + timedelta(days=1),
+            min_experience=3,  # 有门槛
+        )
+        add_car(db, car)
+
+        # 为每个群生成文案
+        draft_hard = _generate_draft_for_group(car, grp_hard, db)
+        draft_new = _generate_draft_for_group(car, grp_new, db)
+        draft_shop = _generate_draft_for_group(car, grp_shop, db)
+        draft_generic = _generate_draft_for_group(car, None, db)
+
+        text_hard = "\n".join(draft_hard)
+        text_new = "\n".join(draft_new)
+        text_shop = "\n".join(draft_shop)
+
+        # 老玩家群应有门槛提示
+        ok1 = "门槛" in text_hard and ("不扶车" in text_hard or "硬核组局" in text_hard)
+        print(f"  {'✓' if ok1 else '✗'} 老玩家群强调门槛")
+
+        # 萌新群应有带新提示
+        ok2 = "萌新" in text_new and "带新" in text_new
+        print(f"  {'✓' if ok2 else '✗'} 萌新群强调带新")
+
+        # 店铺群应有地点强调
+        ok3 = "（硬核旗舰店）" in text_shop and "零食饮料" in text_shop
+        print(f"  {'✓' if ok3 else '✗'} 店铺群强调地点")
+
+        # 每个文案都包含基本信息
+        ok4 = all("《测试本》" in t for t in [text_hard, text_new, text_shop])
+        ok5 = all("上海" in t for t in [text_hard, text_new, text_shop])
+        print(f"  {'✓' if ok4 else '✗'} 所有文案包含本名")
+        print(f"  {'✓' if ok5 else '✗'} 所有文案包含地点")
+
+        # 不同群有不同抬头
+        ok6 = "老玩家" in text_hard and "萌新" in text_new and "店铺" in text_shop
+        print(f"  {'✓' if ok6 else '✗'} 各群文案抬头不同")
+
+        return all([ok1, ok2, ok3, ok4, ok5, ok6])
+    finally:
+        _restore_db(backup)
+
+
+def test_car_target_group_persistence():
+    """v1.3: 车归属群跨程序重启持久化"""
+    sep("车归属群重启持久化")
+    backup = _clean_db()
+    db = load_db()
+    try:
+        grp = Group.create(name="测试持久化群", alias="持久群")
+        add_group(db, grp)
+
+        car = Car.create(
+            name="《持久化测试》", total_players=6, duration_hours=5,
+            city="上海", shop="A店",
+            start_time=datetime.now() + timedelta(days=1),
+            target_group=grp.id,
+        )
+        add_car(db, car)
+
+        # 模拟退出程序：保存 -> 重新加载
+        save_db(db)
+
+        db2 = load_db()
+        car_reloaded = get_car(db2, car.id)
+        ok1 = car_reloaded.target_group == grp.id
+        print(f"  {'✓' if ok1 else '✗'} 车归属群重启后仍在")
+
+        grp_reloaded = get_group(db2, car_reloaded.target_group)
+        ok2 = grp_reloaded and grp_reloaded.alias == "持久群"
+        print(f"  {'✓' if ok2 else '✗'} 可通过归属群ID查到群")
+
+        return all([ok1, ok2])
+    finally:
+        _restore_db(backup)
+
+
 def main():
-    print("🔥 硬核推理车队招募助手 v1.2 - 集成测试套件")
+    print("🔥 硬核推理车队招募助手 v1.3 - 集成测试套件")
     print(f"   Python {sys.version.split()[0]}  |  DB: {DB_FILE}")
 
     results = []
@@ -625,10 +945,15 @@ def main():
         ("车队模板功能", test_templates),
         ("view筛选/排序", test_view_filter_sort),
         ("玩家长期标签", test_player_tags),
-        ("车队复制", test_car_copy),
+        ("车队复制（含群名持久化）", test_car_copy),
         ("序号范围解析", test_parse_index_ranges),
         ("导出格式×范围", test_export_formats),
         ("完整工作流v1.2", test_full_workflow_v12),
+        ("群管理 CRUD", test_group_management),
+        ("来源群记录", test_source_group),
+        ("跨群重复报名检测", test_double_booking),
+        ("多群 draft 生成", test_multi_group_draft),
+        ("车归属群重启持久化", test_car_target_group_persistence),
     ]
     for name, fn in tests:
         try:

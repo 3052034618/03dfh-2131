@@ -4,7 +4,7 @@ from typing import Optional, List
 from datetime import datetime
 
 from models import (
-    Database, Car, Player, Registration, CarTemplate,
+    Database, Car, Player, Registration, CarTemplate, Group,
     EnhancedJSONEncoder, decode_datetime
 )
 
@@ -16,11 +16,12 @@ def _ensure_data_dir():
 
 
 def _migrate_old_data(data: dict) -> Database:
-    """将旧版数据迁移到新版结构（拆分玩家/报名属性 + 增加模板）"""
+    """将旧版数据迁移到新版结构（拆分玩家/报名属性 + 增加模板 + 群管理）"""
     cars_raw = data.get("cars", [])
     players_raw = data.get("players", [])
     regs_raw = data.get("registrations", [])
     templates_raw = data.get("templates", [])
+    groups_raw = data.get("groups", [])  # ✅ v1.3: 群
 
     # --- 迁移 Player：去掉旧报名级字段 ---
     # 旧版 Player 含 available_time, notes, read_this_book
@@ -47,9 +48,9 @@ def _migrate_old_data(data: dict) -> Database:
         except TypeError as e:
             print(f"[警告] 跳过损坏的玩家记录 {p.get('nickname', '?')}: {e}")
 
-    # --- 迁移 Registration：补充当次报名字段 ---
+    # --- 迁移 Registration：补充当次报名字段 + 来源群 ---
     # 旧版 Registration 只有 car_id/player_id/status
-    # 新版增加 available_time, read_this_book, notes, accept_crosscast_override
+    # 新版增加 available_time, read_this_book, notes, accept_crosscast_override, source_group
     migrated_regs: List[Registration] = []
     player_ids = {p.id for p in migrated_players}
     for r in regs_raw:
@@ -60,6 +61,7 @@ def _migrate_old_data(data: dict) -> Database:
         r.setdefault("notes", extra.get("notes", ""))
         r.setdefault("accept_crosscast_override", None)
         r.setdefault("status", "pending")
+        r.setdefault("source_group", None)  # ✅ v1.3: 来源群
         try:
             if pid and pid in player_ids:
                 migrated_regs.append(Registration(**r))
@@ -74,6 +76,7 @@ def _migrate_old_data(data: dict) -> Database:
         c.setdefault("min_experience", 0)
         c.setdefault("status", "open")
         c.setdefault("template_id", None)
+        c.setdefault("target_group", None)  # ✅ v1.3: 归属群
         try:
             migrated_cars.append(Car(**c))
         except TypeError as e:
@@ -90,19 +93,39 @@ def _migrate_old_data(data: dict) -> Database:
         except TypeError as e:
             print(f"[警告] 跳过损坏的模板 {t.get('name', '?')}: {e}")
 
+    # --- 群 ---
+    migrated_groups: List[Group] = []
+    for g in groups_raw:
+        g.setdefault("alias", "")
+        g.setdefault("default_group", False)
+        g.setdefault("publish_style", "formal")
+        g.setdefault("default_city", "")
+        g.setdefault("default_shop", "")
+        g.setdefault("emphasize_barrier", False)
+        g.setdefault("emphasize_friendly", False)
+        g.setdefault("emphasize_venue", False)
+        g.setdefault("footer_note", "")
+        try:
+            migrated_groups.append(Group(**g))
+        except TypeError as e:
+            print(f"[警告] 跳过损坏的群记录 {g.get('name', '?')}: {e}")
+
     db = Database(
         cars=migrated_cars,
         players=migrated_players,
         registrations=migrated_regs,
         templates=migrated_templates,
+        groups=migrated_groups,  # ✅ v1.3
     )
 
     # 有迁移发生就自动保存一次
-    if templates_raw or old_player_extra:
+    if templates_raw or old_player_extra or groups_raw:
         try:
             save_db(db)
             if old_player_extra:
                 print("[信息] 已完成数据迁移：玩家资料与单次报名已分离")
+            if groups_raw:
+                print("[信息] 已完成群管理数据迁移")
         except Exception:
             pass
     return db
@@ -128,6 +151,7 @@ def save_db(db: Database) -> None:
         "players": [p.__dict__ for p in db.players],
         "registrations": [r.__dict__ for r in db.registrations],
         "templates": [t.__dict__ for t in db.templates],
+        "groups": [g.__dict__ for g in db.groups],  # ✅ v1.3
     }
     tmp_file = DB_FILE + ".tmp"
     with open(tmp_file, "w", encoding="utf-8") as f:
@@ -323,3 +347,60 @@ def remove_player_tag(db: Database, player_id: str, tag: str) -> bool:
 
 def list_players_by_tag(db: Database, tag: str) -> List[Player]:
     return [p for p in db.players if p.has_tag(tag)]
+
+
+# ---------- Groups（群管理） ----------
+
+def add_group(db: Database, group: Group) -> Group:
+    # 先去重：如果已存在同ID，先删除
+    db.groups = [g for g in db.groups if g.id != group.id]
+    # 如果是默认群，取消其他群的默认
+    if group.default_group:
+        for g in db.groups:
+            g.default_group = False
+    db.groups.append(group)
+    save_db(db)
+    return group
+
+
+def get_group(db: Database, identifier: str) -> Optional[Group]:
+    """按ID/简称/群名智能查找群"""
+    if not identifier:
+        # 返回默认群
+        for g in db.groups:
+            if g.default_group:
+                return g
+        return db.groups[0] if db.groups else None
+    for g in db.groups:
+        if g.id == identifier:
+            return g
+        if g.alias and g.alias.lower() == identifier.lower():
+            return g
+        if g.name.lower() == identifier.lower():
+            return g
+    # 模糊匹配
+    for g in db.groups:
+        alias_lower = g.alias.lower() if g.alias else ""
+        if identifier.lower() in g.name.lower() or identifier.lower() in alias_lower:
+            return g
+    return None
+
+
+def get_default_group(db: Database) -> Optional[Group]:
+    for g in db.groups:
+        if g.default_group:
+            return g
+    return db.groups[0] if db.groups else None
+
+
+def list_groups(db: Database) -> List[Group]:
+    return sorted(db.groups, key=lambda g: (not g.default_group, g.created_at))
+
+
+def delete_group(db: Database, identifier: str) -> bool:
+    before = len(db.groups)
+    target = get_group(db, identifier)
+    if target:
+        db.groups = [g for g in db.groups if g.id != target.id]
+        save_db(db)
+    return len(db.groups) < before

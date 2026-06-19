@@ -244,7 +244,60 @@ def check_player_tags(car: Car, registration: Registration, player: Player) -> L
     return issues
 
 
-def analyze_match(car: Car, registration: Registration, player: Player) -> MatchResult:
+def check_double_booking(db, car: Car, registration: Registration, player: Player) -> List[MatchIssue]:
+    """跨群重复报名检测：同一玩家在相近时间报名了其他车→warning"""
+    issues = []
+    if not db:
+        return issues
+    from storage import get_car
+    car_start = car.start_time
+    car_end = car_start
+    try:
+        car_end = car_start + _duration_timedelta(car.duration_hours)
+    except Exception:
+        pass
+    # 查找其他车（状态非cancel/done的同时间的其他车）
+    import datetime as _dt
+    now = _dt.datetime.now()
+    overlap_threshold = _dt.timedelta(hours=6)  # 6小时内算冲突
+    for other_reg in db.registrations:
+        if other_reg.player_id != player.id:
+            continue
+        if other_reg.car_id == car.id:
+            continue
+        if other_reg.status in ("kick", "rejected", "cancel"):
+            continue
+        other_car = get_car(db, other_reg.car_id)
+        if not other_car:
+            continue
+        if other_car.status in ("cancel", "done"):
+            continue
+        other_start = other_car.start_time
+        try:
+            other_end = other_start + _duration_timedelta(other_car.duration_hours)
+        except Exception:
+            other_end = other_start
+        # 时间是否重叠或6小时内
+        if (car_start - other_end) <= overlap_threshold and (other_start - car_end) <= overlap_threshold:
+            other_grp = other_car.target_group or "其他群"
+            other_grp_name = f"「{other_grp}」的" if other_grp else ""
+            issues.append(MatchIssue(
+                "double_booking",
+                f"该玩家也报名了{other_grp_name}另一车《{other_car.name}》"
+                f"（{other_start.strftime('%m-%d %H:%M')}）",
+                "warning",
+            ))
+    return issues
+
+
+def _duration_timedelta(hours: float):
+    """小时转timedelta"""
+    import datetime as _dt
+    total_minutes = int(hours * 60)
+    return _dt.timedelta(minutes=total_minutes)
+
+
+def analyze_match(db, car: Car, registration: Registration, player: Player) -> MatchResult:
     result = MatchResult(registration, player)
 
     # 正面标签 -> 基础加分
@@ -270,6 +323,15 @@ def analyze_match(car: Car, registration: Registration, player: Player) -> Match
                 result.severity_score += 10
             else:
                 result.severity_score += 1
+
+    # 跨群重复报名检查（需要db）
+    for issue in check_double_booking(db, car, registration, player):
+        result.issues.append(issue)
+        if issue.severity == "critical":
+            result.severity_score += 100
+        elif issue.severity == "warning":
+            result.severity_score += 10
+
     return result
 
 
@@ -288,7 +350,7 @@ def triage_registrations(db, car: Car, registrations: List[Registration],
         player = get_player(db, reg.player_id)
         if not player:
             continue
-        results.append(analyze_match(car, reg, player))
+        results.append(analyze_match(db, car, reg, player))
 
     # --- 筛选 ---
     if filter_status == "pending":

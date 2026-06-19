@@ -11,7 +11,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict, Any
 
-from models import Car, Player, Registration, CarTemplate
+from models import Car, Player, Registration, CarTemplate, Group
 from storage import (
     load_db, save_db,
     add_car, get_car, list_cars, update_car_status, delete_car,
@@ -21,59 +21,54 @@ from storage import (
     update_registration_status,
     add_template, get_template, list_templates, delete_template,
     add_player_tag, remove_player_tag, list_players_by_tag, PRESET_TAGS,
+    add_group, get_group, get_default_group, list_groups, delete_group,
 )
 from matcher import triage_registrations, MatchResult
 
 
 BANNER = r"""
 ╔══════════════════════════════════════════╗
-║  🔥 硬核推理车队招募助手 v1.2 🔥         ║
+║  🔥 硬核推理车队招募助手 v1.3 🔥         ║
 ║  Hardcore Detective Car Manager         ║
-║  长期多群发车 · 工作台版                ║
+║  多群长期发车 · 工作台版                ║
 ╚══════════════════════════════════════════╝
 """
 
 HELP = """
 命令列表：
-  new [-t 模板名]        开新车（可用 -t 直接套用模板）
-  copy <车ID>            从已有车复制出新车（可改时间/店铺/群）
-  add <车ID>             为指定车添加报名（含玩家长期标签录入）
-  view <车ID> [选项]     查看报名三段式分析（支持屏幕内直接批量审核）
-       筛选选项： --pending   仅未处理
-                  --eligible  仅可进正车（无严重冲突）
-                  --approved  仅已确认
-                  --bench     仅替补
-                  --conflict  仅严重冲突
+  new [-t 模板名] [-g 群]      开新车（可用 -t 模板，-g 指定群）
+  copy <车ID> [-g 群]          从已有车复制出新车（可改时间/店铺/群）
+  add <车ID> [-g 来源群]       为指定车添加报名（含来源群记录）
+  view <车ID> [选项]           查看报名分析（含来源群、跨群重复提示）
+       筛选选项： --pending / --eligible / --approved / --bench / --conflict
        排序选项： --sort score|experience|time|created
-       （不带选项时会弹出交互式筛选/排序/批量审核菜单）
+       批量操作: a1-3 approve / b4,5 bench / k6 kick（用屏幕上的序号）
+  draft <车ID> [群名...]       生成多群报名文案（支持一次生成多群不同版本）
   export <车ID> [格式] [范围]
        格式: all(默认) / notice(群公告) / check(审核表) / shop(店铺表)
        范围: approved(仅已确认) / bench(已确认+替补)
   list                   列出所有车辆
-  draft <车ID>           生成多群报名文案 + 车头私聊登记提示草稿
   status <车ID> <open|full|done|cancel>
-  approve <车ID> <序号...>   批量确认入队
-  bench   <车ID> <序号...>   批量设为替补
-  kick    <车ID> <序号...>   批量移除
-  info <车ID>            车辆详情（带长期标签显示）
+  approve/bench/kick <车ID> <序号...>
+  info <车ID>            车辆详情（含归属群、标签）
   del <车ID>             删除车辆
-  players [标签]         玩家资料库（可按标签筛选）
-  tag <玩家昵称> +/-<标签>  给玩家加/减长期标签（如 tag 小明 +靠谱 -易迟到）
-  template save <模板名> [车ID]   保存配置为模板（默认从最新车）
-  template list                 列出所有模板
-  template del <模板名/ID>       删除模板
+  players [标签]         玩家资料库（含常用来源群）
+  tag <玩家昵称> +/-<标签>  给玩家加/减长期标签
+  group save <群名> [简称]   保存群配置（可设默认、文案偏好）
+  group list              列出所有群
+  group del <群名/ID/简称>  删除群配置
+  template save/list/del   模板管理
   help / ?               显示此帮助
   quit / exit / q        退出
 
 使用示例：
-  > new -t "周末硬核标配"
-  > copy ab12cd34                      # 复制车，改时间店铺
-  > add ab12cd34
-  > view ab12cd34 --pending --sort experience
-  > view ab12cd34                      # 进入交互式，直接 a1-6 批量 approve
-  > approve ab12cd34 1 3 5 7 8 10
-  > export ef56gh78 notice approved    # 仅导出群公告+已确认
-  > players 跳车                        # 筛出所有有「跳车」标签的玩家
+  > group save 硬核老玩家群 A群 --default
+  > new -t "周末硬核标配" -g A群
+  > copy ab12cd34 -g B群
+  > add ef56gh78 -g A群
+  > view ef56gh78 --pending --sort experience
+  > draft ef56gh78 A群 B群 C群        # 同时生成三群不同版本
+  > export ef56gh78 notice approved
 """
 
 
@@ -232,6 +227,152 @@ def parse_index_ranges(text: str) -> List[int]:
     return sorted(result)
 
 
+def _prompt_select_group(db, default: Optional[str] = None,
+                         prompt_msg: str = "选择目标群") -> Optional[Group]:
+    """交互式选群：显示所有群，按编号或名称选择，可输入空跳过"""
+    groups = list_groups(db)
+    if not groups:
+        return None
+    def_grp = get_default_group(db)
+    print(color(f"  可用群列表：", "dim"))
+    for i, g in enumerate(groups, 1):
+        mark = color("★", "yellow") if g.default_group else " "
+        style_tag = ""
+        if g.emphasize_barrier:
+            style_tag += "🎯强调门槛"
+        if g.emphasize_friendly:
+            style_tag += "👶带新友好"
+        if g.emphasize_venue:
+            style_tag += "📍强调地点"
+        line = f"    {i:>2}. {mark} {g.display_name()}"
+        if g.default_city:
+            line += f" [{g.default_city}·{g.default_shop}]"
+        if style_tag:
+            line += f" {style_tag}"
+        print(line)
+
+    while True:
+        default_val = ""
+        if default:
+            default_val = default
+        elif def_grp:
+            default_val = def_grp.alias or def_grp.name or ""
+        suffix = f" [默认:{default_val}]" if default_val else " [空=不指定]"
+        val = input(f"  {prompt_msg}{suffix}: ").strip()
+        if not val and default:
+            val = default
+        if not val:
+            return None
+        if val.isdigit():
+            idx = int(val) - 1
+            if 0 <= idx < len(groups):
+                return groups[idx]
+        # 按名称/简称找
+        g = get_group(db, val)
+        if g:
+            return g
+        print(color("  ! 无效编号/群名，重新输入或直接回车跳过", "red"))
+
+
+# =====================================================
+#  群管理命令
+# =====================================================
+
+def cmd_group(db, args):
+    if not args:
+        print(color("! 用法：group <save|list|del> ...", "red"))
+        return
+    sub = args[0].lower()
+    if sub == "list":
+        _cmd_group_list(db)
+    elif sub == "save":
+        _cmd_group_save(db, args[1:])
+    elif sub in ("del", "rm", "delete", "remove"):
+        _cmd_group_del(db, args[1:])
+    else:
+        print(color(f"! 未知子命令 group {sub}", "red"))
+
+
+def _cmd_group_list(db):
+    groups = list_groups(db)
+    if not groups:
+        print(color("! 暂无群配置，用 group save <群名> [简称] 创建", "yellow"))
+        return
+    print(color(f"\n{'★':<2} {'ID':<10} {'简称':<8} {'群名':24} {'默认城市':12} 文案偏好", "bold"))
+    print("-" * 80)
+    for g in groups:
+        star = color("★", "yellow") if g.default_group else " "
+        prefs = []
+        if g.emphasize_barrier: prefs.append("🎯强调门槛")
+        if g.emphasize_friendly: prefs.append("👶带新友好")
+        if g.emphasize_venue: prefs.append("📍强调地点")
+        style_map = {"formal": "正式", "casual": "轻松", "hardcore": "硬核", "friendly": "友好"}
+        prefs.insert(0, f"口吻:{style_map.get(g.publish_style, g.publish_style)}")
+        city = f"{g.default_city}·{g.default_shop}" if g.default_city else "-"
+        print(f"{star:<2} {g.id:<10} {(g.alias or '-'):<8} {(g.name or '-')[:24]:24} {city[:12]:12} {'  '.join(prefs)}")
+        if g.footer_note:
+            print(f"     {color('📝 ' + g.footer_note, 'dim')}")
+    print()
+
+
+def _cmd_group_save(db, args):
+    if not args:
+        print(color("! 用法：group save <群名> [简称] [--default]", "red"))
+        return
+    name = args[0]
+    alias = args[1] if len(args) >= 2 and not args[1].startswith("--") else ""
+    is_default = "--default" in args or "-d" in args
+
+    existing = get_group(db, name) or (get_group(db, alias) if alias else None)
+    if existing:
+        if not prompt_bool(f"群「{name}」已存在，覆盖？", False):
+            return
+        delete_group(db, existing.id)
+
+    print(color(f"\n配置群「{name}」({alias or '无简称'})", "cyan"))
+    city = prompt("默认城市（可空）", required=False, default="")
+    shop = prompt("默认店铺（可空）", required=False, default="")
+    style = prompt(
+        "文案口吻（formal正式 / casual轻松 / hardcore硬核 / friendly友好）",
+        default="formal",
+        validator=lambda x: (x in ("formal", "casual", "hardcore", "friendly"),
+                             "请选择: formal/casual/hardcore/friendly"),
+    )
+    emph_barrier = prompt_bool("文案是否强调门槛（老玩家群）", False)
+    emph_friendly = prompt_bool("文案是否强调可带新（萌新群）", False)
+    emph_venue = prompt_bool("文案是否强调时间地点（店铺群）", False)
+    footer = prompt("群专属文末注（如'请先看群规再报名'，可空）", required=False, default="")
+
+    if not is_default and get_default_group(db) is None:
+        is_default = prompt_bool("设为默认群？（new/copy/draft 自动选用）", True)
+
+    group = Group.create(
+        name=name, alias=alias, default_group=is_default,
+        publish_style=style, default_city=city, default_shop=shop,
+        emphasize_barrier=emph_barrier, emphasize_friendly=emph_friendly,
+        emphasize_venue=emph_venue, footer_note=footer,
+    )
+    add_group(db, group)
+    print(color(f"✓ 群已保存: {group.display_name()}", "green"))
+    if is_default:
+        print(color("  （已设为默认群）", "yellow"))
+
+
+def _cmd_group_del(db, args):
+    if not args:
+        print(color("! 用法：group del <群名/ID/简称>", "red"))
+        return
+    identifier = " ".join(args)
+    g = get_group(db, identifier)
+    if not g:
+        print(color(f"! 未找到群: {identifier}", "red"))
+        return
+    if not prompt_bool(f"确认删除群「{g.display_name()}」？", False):
+        return
+    if delete_group(db, g.id):
+        print(color(f"✓ 已删除: {g.display_name()}", "green"))
+
+
 # =====================================================
 #  模板命令
 # =====================================================
@@ -333,7 +474,8 @@ def _cmd_template_del(db, args):
 def cmd_new(db, args):
     template_id = None
     template = None
-    # 解析 -t 参数
+    target_group = None
+    # 解析 -t / -g 参数
     i = 0
     while i < len(args):
         if args[i] in ("-t", "--template") and i + 1 < len(args):
@@ -345,6 +487,15 @@ def cmd_new(db, args):
                 return
             template_id = template.id
             print(color(f"✓ 套用模板：{template.name}", "green"))
+            i += 2
+        elif args[i] in ("-g", "--group") and i + 1 < len(args):
+            grp_name = args[i + 1]
+            target_group = get_group(db, grp_name)
+            if not target_group:
+                print(color(f"! 未找到群：{grp_name}", "red"))
+                print(color("  用 group list 查看所有可用群", "dim"))
+                return
+            print(color(f"✓ 归属群：{target_group.display_name()}", "green"))
             i += 2
         else:
             i += 1
@@ -392,11 +543,20 @@ def cmd_new(db, args):
         default=defaults.min_experience, validator=v_int_nonneg,
     ))
 
+    # 选群
+    if target_group is None and (db.groups or True):  # 有配置过群时才问
+        g = _prompt_select_group(db, default=target_group.name if target_group else None)
+        if g:
+            target_group = g
+
+    target_group_id = target_group.id if target_group else None
+
     car = Car.create(
         name=name, total_players=total_players, duration_hours=duration_hours,
         city=city, shop=shop, start_time=start_dt,
         role_constraints=role_constraints, require_unread=require_unread,
         min_experience=min_exp, template_id=template_id,
+        target_group=target_group_id,
     )
     add_car(db, car)
 
@@ -405,6 +565,8 @@ def cmd_new(db, args):
     print(f"  简称: {car.name} · {car.total_players}人 · {car.duration_hours}h")
     print(f"  时间: {car.start_time.strftime('%Y-%m-%d %H:%M')}")
     print(f"  地点: {car.city} · {car.shop}")
+    if target_group:
+        print(f"  归属群: {target_group.display_name()}")
     if car.role_constraints:
         print(f"  配置: {car.role_constraints}")
     if car.require_unread:
@@ -461,13 +623,47 @@ def _get_car_or_error(db, car_id):
 
 def cmd_add(db, args):
     if not args:
-        print(color("! 用法：add <车辆ID>", "red"))
+        print(color("! 用法：add <车辆ID> [-g 来源群]", "red"))
         return
-    car = _get_car_or_error(db, args[0])
+    # 解析 -g 参数和车ID
+    source_group = None
+    car_id = None
+    i = 0
+    while i < len(args):
+        if args[i] in ("-g", "--group") and i + 1 < len(args):
+            grp_name = args[i + 1]
+            source_group = get_group(db, grp_name)
+            if not source_group:
+                print(color(f"! 未找到群：{grp_name}", "red"))
+                print(color("  用 group list 查看所有可用群", "dim"))
+                return
+            print(color(f"✓ 来源群：{source_group.display_name()}", "green"))
+            i += 2
+        else:
+            if not car_id:
+                car_id = args[i]
+            i += 1
+
+    if not car_id:
+        print(color("! 未指定车辆ID", "red"))
+        return
+    car = _get_car_or_error(db, car_id)
     if not car:
         return
+
     print(color(f"\n=== 添加报名 · {car.name} ({car.id}) ===", "bold", "cyan"))
     print("说明：玩家基础资料（昵称/性别/累计经验）长期复用；可到时间/是否已读本/备注按当次车录入，不影响别的车。\n")
+
+    # 如果没通过 -g 指定，交互问来源群（默认用车的目标群）
+    if source_group is None:
+        default_grp = None
+        if car.target_group:
+            default_grp = get_group(db, car.target_group)
+        g = _prompt_select_group(db,
+            default=default_grp.alias if default_grp else None,
+            prompt_msg="【本次】来源群（玩家从哪个群来的）")
+        if g:
+            source_group = g
 
     nickname = prompt("玩家昵称", required=True)
     gender_raw = prompt("性别（男/女）", required=True, validator=v_gender)
@@ -580,12 +776,14 @@ def cmd_add(db, args):
         accept_cc_this_time = prompt_bool("    本次是否接受反串？", accept_cc_default)
 
     # ------- 创建/更新当次报名 -------
+    source_group_id = source_group.id if source_group else None
     reg = Registration.create(
         car_id=car.id, player_id=player.id,
         available_time=avail_time, read_this_book=has_read,
         notes=notes, accept_crosscast_override=accept_cc_this_time,
+        source_group=source_group_id,  # ✅ v1.3: 记录来源群
     )
-    reg = add_registration(db, reg)
+    add_registration(db, reg)
 
     cc_str = "接受反串" if reg.effective_accept_crosscast(player) else "不反串"
     print(color(f"\n✓ 本次报名登记成功！", "green"))
@@ -593,6 +791,8 @@ def cmd_add(db, args):
     td = tags_display(player)
     if td:
         print(f"  标签: {td}")
+    if source_group:
+        print(f"  来源群: {source_group.display_name()}")
     print(f"  本次: 可到{reg.available_time} · "
           f"{'已读本⚠️' if reg.read_this_book else '未读本✓'} · "
           f"{cc_str}")
@@ -618,14 +818,22 @@ def cmd_players(db, args):
             print(color(f"! 没有含标签「{tag_filter}」的玩家", "yellow"))
             return
         print(color(f"🔍 筛选标签「{tag_filter}」，共 {len(players)} 名玩家：", "cyan", "bold"))
-    print(color(f"\n{'昵称':14} {'性别':<4} {'经验':<8} {'反串':<4} {'报名':<6} 标签", "bold"))
-    print("-" * 82)
+    print(color(f"\n{'昵称':14} {'性别':<4} {'经验':<8} {'反串':<4} {'报名':<6} {'常用群':<10} 标签", "bold"))
+    print("-" * 90)
     for p in sorted(players, key=lambda x: (len(x.risk_tags()) > 0, -x.experience_count)):
         regs = get_player_registrations(db, p.id)
         cc = "✓" if p.accept_crosscast else "✗"
-        td = tags_display(p, max_len=60) or color("（无标签）", "dim")
+        td = tags_display(p, max_len=50) or color("（无标签）", "dim")
+        # 常用来源群
+        group_counts = {}
+        for r in regs:
+            if r.source_group:
+                grp = get_group(db, r.source_group)
+                key = grp.alias or grp.name if grp else r.source_group
+                group_counts[key] = group_counts.get(key, 0) + 1
+        most_common = max(group_counts.items(), key=lambda x: x[1])[0] if group_counts else "-"
         print(f"{p.nickname[:14]:14} {p.gender:<4} {exp_display(p.experience_count):<8} "
-              f"{cc:<4} {len(regs):<6} {td}")
+              f"{cc:<4} {len(regs):<6} {most_common[:10]:<10} {td}")
     print(f"\n共 {len(players)} 名玩家")
 
 
@@ -785,7 +993,7 @@ def cmd_view(db, args):
         print(color(f"\n{'='*64}", "bold", "cyan"))
         print(color(f"🚗 {car.name}  报名分析  ({car.id})", "bold", "cyan"))
         print(color(f"{'='*64}", "bold", "cyan"))
-        _print_car_header(car)
+        _print_car_header(car, db)
         filter_label = {
             "all": "全部", "pending": "仅未处理", "eligible": "仅可进正车(无严重冲突)",
             "approved": "仅已确认", "bench": "仅替补", "conflict": "仅严重冲突",
@@ -828,6 +1036,11 @@ def cmd_view(db, args):
                 extra_bits.append(f"可到:{reg.available_time}")
                 if reg.read_this_book:
                     extra_bits.append(color("已读本⚠️", "red"))
+                # 来源群
+                if reg.source_group:
+                    grp = get_group(db, reg.source_group)
+                    if grp:
+                        extra_bits.append(color(f"群:{grp.alias or grp.name}", "cyan"))
                 if extra_bits:
                     print(f"     {color(' | '.join(extra_bits), 'dim')}")
                 if reg.notes:
@@ -933,7 +1146,7 @@ def _apply_bulk_action(db, car, idx_map, targets, action):
             update_car_status(db, car.id, "full")
 
 
-def _print_car_header(car):
+def _print_car_header(car, db=None):
     time_str = car.start_time.strftime("%Y-%m-%d %H:%M")
     weekday = ["一", "二", "三", "四", "五", "六", "日"][car.start_time.weekday()]
     status_map = {"open": "招集中", "full": "已满", "done": "已结束", "cancel": "已取消"}
@@ -943,6 +1156,10 @@ def _print_car_header(car):
     exp_str = f"≥{car.min_experience}硬核本" if car.min_experience > 0 else "无门槛"
     print(f"  🕒 {time_str} (周{weekday}) · 约{car.duration_hours}小时")
     print(f"  📍 {car.city} · {car.shop}")
+    if car.target_group and db:
+        grp = get_group(db, car.target_group)
+        if grp:
+            print(f"  👥 归属群: {grp.display_name()}")
     print(f"  👥 {car.total_players}人  "
           f"| 状态: {color(st, stc, 'bold')}  "
           f"| 未读本: {'✓' if car.require_unread else '✗'}  "
@@ -1017,8 +1234,8 @@ def cmd_list(db, _):
     if not cars:
         print(color("! 暂无车辆，使用 new 命令开新车", "yellow"))
         return
-    print(color(f"\n{'ID':10} {'本名':14} {'人数':>5} {'时间':18} {'地点':14} {'状态':8} 报名", "bold"))
-    print("-" * 78)
+    print(color(f"\n{'ID':10} {'本名':14} {'人数':>5} {'时间':18} {'地点':14} {'群':8} {'状态':8} 报名", "bold"))
+    print("-" * 86)
     for c in cars:
         regs = get_registrations_by_car(db, c.id)
         approved = len([r for r in regs if r.status == "approved"])
@@ -1028,8 +1245,16 @@ def cmd_list(db, _):
         time_str = c.start_time.strftime("%m-%d %H:%M")
         loc = f"{c.city}·{c.shop}"
         exp_tag = f"≥{c.min_experience}" if c.min_experience > 0 else "0门槛"
+        # 归属群
+        grp_str = "-"
+        if c.target_group:
+            grp = get_group(db, c.target_group)
+            if grp:
+                grp_str = grp.alias or grp.name
+                if len(grp_str) > 8:
+                    grp_str = grp_str[:7] + "…"
         print(f"{c.id:10} {c.name[:14]:14} {approved}/{c.total_players:>4} "
-              f"{time_str:18} {loc[:14]:14} {st:10} {len(regs):>3}  {exp_tag}")
+              f"{time_str:18} {loc[:14]:14} {grp_str:8} {st:10} {len(regs):>3}  {exp_tag}")
     print()
 
 
@@ -1058,7 +1283,7 @@ def cmd_info(db, args):
     print(color(f"\n=== 车辆详情 ===", "bold", "cyan"))
     print(f"  ID: {color(car.id, 'yellow', 'bold')}")
     print(f"  本名: {car.name}")
-    _print_car_header(car)
+    _print_car_header(car, db)
     print(f"  创建时间: {car.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
     if car.template_id:
         tpl = get_template(db, car.template_id)
@@ -1077,9 +1302,15 @@ def cmd_info(db, args):
                           "rejected": color("✗拒绝", "red")}
             st = status_map.get(reg.status, reg.status)
             cc = reg.effective_accept_crosscast(p)
+            extra = []
+            if reg.source_group:
+                grp = get_group(db, reg.source_group)
+                if grp:
+                    extra.append(color(f"群:{grp.alias or grp.name}", "cyan"))
             print(f"    {i:>2}. {p.nickname} ({p.gender}·{exp_display(p.experience_count)}) "
                   f"· 可到:{reg.available_time} · {'已读本⚠️' if reg.read_this_book else ''} "
-                  f"· {'反串OK' if cc else ''} · {st}")
+                  f"· {'反串OK' if cc else ''} · {st}"
+                  + (f" · {' '.join(extra)}" if extra else ""))
             td = tags_display(p, max_len=50)
             if td:
                 print(f"        🏷️ {td}")
@@ -1109,9 +1340,31 @@ def cmd_del(db, args):
 
 def cmd_copy(db, args):
     if not args:
-        print(color("! 用法：copy <车辆ID>", "red"))
+        print(color("! 用法：copy <车辆ID> [-g 群名]", "red"))
         return
-    src = _get_car_or_error(db, args[0])
+    # 解析 -g 参数和车ID
+    target_group = None
+    car_id = None
+    i = 0
+    while i < len(args):
+        if args[i] in ("-g", "--group") and i + 1 < len(args):
+            grp_name = args[i + 1]
+            target_group = get_group(db, grp_name)
+            if not target_group:
+                print(color(f"! 未找到群：{grp_name}", "red"))
+                print(color("  用 group list 查看所有可用群", "dim"))
+                return
+            print(color(f"✓ 目标群：{target_group.display_name()}", "green"))
+            i += 2
+        else:
+            if not car_id:
+                car_id = args[i]
+            i += 1
+
+    if not car_id:
+        print(color("! 未指定车辆ID", "red"))
+        return
+    src = _get_car_or_error(db, car_id)
     if not src:
         return
 
@@ -1121,7 +1374,16 @@ def cmd_copy(db, args):
     name = prompt("本名（留空=与源车相同）", default=src.name, required=True)
     city = prompt("城市", default=src.city, required=True)
     shop = prompt("店铺（可换不同分店）", default=src.shop, required=True)
-    group_name = prompt("目标群名（如 硬核交流群A / 周末拼车群；可留空）", required=False)
+
+    # 选群（覆盖 -g 或交互选择）
+    src_grp = None
+    if src.target_group:
+        src_grp = get_group(db, src.target_group)
+    if target_group is None:
+        default_val = target_group.name if target_group else (src_grp.alias if src_grp else None)
+        g = _prompt_select_group(db, default=default_val, prompt_msg="选择目标群（归属群）")
+        if g:
+            target_group = g
 
     start_dt = None
     while start_dt is None:
@@ -1140,11 +1402,14 @@ def cmd_copy(db, args):
     require_unread = prompt_bool("要求未读本", default=src.require_unread)
     min_exp = int(prompt("最低经验（0=无门槛）", default=src.min_experience, validator=v_int_nonneg))
 
+    target_group_id = target_group.id if target_group else None
+
     new_car = src.copy(
         name=name, start_time=start_dt, city=city, shop=shop,
         total_players=total_players, duration_hours=duration_hours,
         role_constraints=role_constraints,
         require_unread=require_unread, min_experience=min_exp,
+        target_group=target_group_id,  # ✅ v1.3: 持久化归属群
     )
     add_car(db, new_car)
 
@@ -1153,8 +1418,8 @@ def cmd_copy(db, args):
     print(f"  {new_car.name} · {new_car.total_players}人 · {new_car.duration_hours}h")
     print(f"  时间: {new_car.start_time.strftime('%Y-%m-%d %H:%M')}")
     print(f"  地点: {new_car.city} · {new_car.shop}")
-    if group_name:
-        print(f"  群: {group_name}")
+    if target_group:
+        print(f"  归属群: {target_group.display_name()}")
     if min_exp > 0:
         print(f"  门槛: ≥{min_exp}硬核本")
     else:
@@ -1185,18 +1450,8 @@ def cmd_copy(db, args):
 #  草稿/文案命令（多群发布）
 # =====================================================
 
-def cmd_draft(db, args):
-    if not args:
-        print(color("! 用法：draft <车辆ID>", "red"))
-        return
-    car = _get_car_or_error(db, args[0])
-    if not car:
-        return
-
-    group_name = " ".join(args[1:]) if len(args) > 1 else ""
-    if not group_name:
-        group_name = prompt("目标群名（如 硬核交流群A；可留空）", required=False) or ""
-
+def _generate_draft_for_group(car, group, db):
+    """根据群的强调偏好生成专属版本文案"""
     weekday = ["一", "二", "三", "四", "五", "六", "日"][car.start_time.weekday()]
     time_str = car.start_time.strftime(f"%m月%d日 周{weekday} %H:%M")
     end_time = car.start_time + timedelta(hours=car.duration_hours)
@@ -1209,24 +1464,67 @@ def cmd_draft(db, args):
     pending_count = len([r for r in regs if r.status == "pending"])
     remaining = max(0, car.total_players - approved_count)
 
-    # --- 报名文案（发到群里吸引报名） ---
-    print(color("\n" + "═" * 58, "bold", "cyan"))
-    print(color("  📝 群报名文案（复制到群内发布）", "bold", "cyan"))
-    print(color("═" * 58, "bold", "cyan"))
+    group_name = group.name if group else ""
+    group_alias = group.alias if group else ""
+    display_name = group_alias or group_name
 
-    group_tag = f"【{group_name}】" if group_name else ""
-    draft_lines = [
-        f"{group_tag}🔥硬核发车🔥",
-        f"📖《{car.name}》",
-        f"⏰ {time_str}～{end_str}（约{car.duration_hours:.0f}h）",
-        f"📍 {loc_str}",
-        f"👥 {car.total_players}人 | {exp_str}",
-    ]
+    draft_lines = []
+    group_tag = f"【{display_name}】" if display_name else ""
+
+    style = group.publish_style if group else "formal"
+    style_emoji = {"formal": "🔥", "casual": "🎉", "hardcore": "💀", "friendly": "💖"}
+    style_title = {"formal": "硬核发车", "casual": "开车啦", "hardcore": "硬核组局", "friendly": "萌新友好"}
+    emoji = style_emoji.get(style, "🔥")
+    title = style_title.get(style, "硬核发车")
+
+    draft_lines.append(f"{group_tag}{emoji}{title}{emoji}")
+    draft_lines.append(f"📖《{car.name}》")
+
+    emphasized = []
+
+    if group and group.emphasize_venue:
+        emphasized.extend([
+            f"📍 {loc_str}（{car.shop}）",
+            f"⏰ {time_str}～{end_str}（约{car.duration_hours:.0f}h）",
+            f"👥 {car.total_players}人",
+        ])
+    elif group and group.emphasize_barrier:
+        emphasized.extend([
+            f"⏰ {time_str}～{end_str}（约{car.duration_hours:.0f}h）",
+            f"💪 门槛：{exp_str}",
+            f"📍 {loc_str}",
+        ])
+    elif group and group.emphasize_friendly:
+        emphasized.extend([
+            f"⏰ {time_str}～{end_str}（约{car.duration_hours:.0f}h）",
+            f"📍 {loc_str}",
+            f"👥 {car.total_players}人 · 新人友好，老玩家带新",
+        ])
+    else:
+        emphasized.extend([
+            f"⏰ {time_str}～{end_str}（约{car.duration_hours:.0f}h）",
+            f"📍 {loc_str}",
+            f"👥 {car.total_players}人 | {exp_str}",
+        ])
+
+    draft_lines.extend(emphasized)
+
+    if group and group.emphasize_barrier and car.min_experience > 0:
+        draft_lines.append("⚠️ 硬核本不扶车，请确保有足够经验")
+
+    if group and group.emphasize_friendly and car.min_experience == 0:
+        draft_lines.append("💖 萌新可上车，老玩家耐心带新，放心报名")
+
+    if group and group.emphasize_venue:
+        draft_lines.append("🏠 店铺环境好，有免费零食饮料，车位紧张请准时")
+
     if car.role_constraints:
         draft_lines.append(f"🎭 {car.role_constraints}")
     if car.require_unread:
-        draft_lines.append("📜 要求全员未读本")
+        draft_lines.append("📜 要求全员未读本，严禁天眼/剧透")
+
     draft_lines.append("")
+
     if remaining > 0:
         draft_lines.append(f"✅ 已确认 {approved_count}/{car.total_players}  🔓 还剩 {remaining} 席")
     else:
@@ -1234,38 +1532,168 @@ def cmd_draft(db, args):
     if pending_count > 0:
         draft_lines.append(f"⏳ 审核中 {pending_count} 人")
     draft_lines.append("")
-    draft_lines.append("👇 有意私车头报名，格式：")
-    draft_lines.append("  昵称 / 性别 / 可到时间 / 硬核本数 / 是否反串")
-    for line in draft_lines:
-        print(line)
 
-    # --- 车头私聊登记提示（自己用） ---
-    print(color("\n" + "─" * 58, "dim"))
-    print(color("  🗂️ 车头私聊登记提示（自己记录用）", "bold", "yellow"))
-    print(color("─" * 58, "dim"))
+    if group and group.emphasize_barrier:
+        draft_lines.append("👇 有意私车头报名，请提供：")
+        draft_lines.append("  昵称 / 性别 / 可到时间 / 硬核本数 / 是否反串 / 最近玩过的3个硬核本")
+    elif group and group.emphasize_friendly:
+        draft_lines.append("👇 萌新小伙伴私车头报名就行啦：")
+        draft_lines.append("  昵称 / 性别 / 可到时间 / 有没有玩过本（没有也没关系）")
+    else:
+        draft_lines.append("👇 有意私车头报名，格式：")
+        draft_lines.append("  昵称 / 性别 / 可到时间 / 硬核本数 / 是否反串")
 
-    print(f"\n车: {car.name}  ID: {car.id}  群: {group_name or '未指定'}")
+    if group and group.footer_note:
+        draft_lines.append("")
+        draft_lines.append(f"📝 {group.footer_note}")
+
+    return draft_lines
+
+
+def cmd_draft(db, args):
+    if not args:
+        print(color("! 用法：draft <车辆ID> [-g 群名1,群名2,...]", "red"))
+        print(color("  示例: draft ab12 -g 老玩家群,萌新群", "dim"))
+        return
+
+    car_id = args[0]
+    car = _get_car_or_error(db, car_id)
+    if not car:
+        return
+
+    selected_groups = []
+    group_names = []
+    i = 1
+    while i < len(args):
+        if args[i] == "-g" and i + 1 < len(args):
+            group_names = [x.strip() for x in args[i+1].replace("，", ",").split(",") if x.strip()]
+            i += 2
+        else:
+            i += 1
+
+    for gn in group_names:
+        grp = get_group(db, gn)
+        if grp:
+            selected_groups.append(grp)
+        else:
+            print(color(f"! 未找到群「{gn}」，已跳过", "yellow"))
+
+    if not selected_groups and car.target_group:
+        grp = get_group(db, car.target_group)
+        if grp:
+            selected_groups.append(grp)
+
+    if not selected_groups and list_groups(db):
+        print(color("\n请选择目标群（可多选，用逗号分隔序号，如 1,3,4；a=全选；回车=不指定群）", "cyan"))
+        all_groups = list_groups(db)
+        for j, g in enumerate(all_groups, 1):
+            flags = []
+            if g.default_group:
+                flags.append("默认")
+            if g.emphasize_barrier:
+                flags.append("重门槛")
+            if g.emphasize_friendly:
+                flags.append("重带新")
+            if g.emphasize_venue:
+                flags.append("重地点")
+            flag_str = f" [{','.join(flags)}]" if flags else ""
+            print(f"  {j}. {g.alias or g.name}（{g.name}）{flag_str}")
+
+        sel = prompt("选择群", required=False) or ""
+        if sel.lower() in ("a", "all", "全部"):
+            selected_groups = all_groups
+        elif sel:
+            for idx in parse_index_ranges(sel):
+                if 1 <= idx <= len(all_groups):
+                    selected_groups.append(all_groups[idx-1])
+
+    if not selected_groups:
+        selected_groups = [None]
+
+    all_drafts = []
+
+    for idx, grp in enumerate(selected_groups, 1):
+        grp_label = grp.alias or grp.name if grp else "通用版"
+        draft_lines = _generate_draft_for_group(car, grp, db)
+        all_drafts.append((grp_label, grp, draft_lines))
+
+        print(color("\n" + "═" * 60, "bold", "cyan"))
+        print(color(f"  {idx}. 📝 {grp_label} 版本文案", "bold", "cyan"))
+        print(color("═" * 60, "bold", "cyan"))
+        for line in draft_lines:
+            print(line)
+        print()
+
+        if grp:
+            full_text = "\n".join(draft_lines)
+            if prompt_bool(f"  📋 将「{grp_label}」文案复制到剪贴板？", True):
+                try:
+                    if os.name == "nt":
+                        import subprocess
+                        p = subprocess.Popen(["clip"], stdin=subprocess.PIPE)
+                        p.communicate(full_text.encode("utf-16-le"))
+                        print(color(f"    ✓ 已复制「{grp_label}」文案", "green"))
+                except Exception:
+                    pass
+
+    if len(all_drafts) > 1:
+        if prompt_bool("\n  📤 将所有群的文案合并导出到文件？", True):
+            from datetime import datetime as dt
+            out_lines = []
+            for label, grp, lines in all_drafts:
+                out_lines.append(f"{'='*60}")
+                out_lines.append(f"【{label}】")
+                out_lines.append(f"{'='*60}")
+                out_lines.extend(lines)
+                out_lines.append("")
+
+            out_path = f"draft_{car.id}_{dt.now().strftime('%Y%m%d_%H%M')}.txt"
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(out_lines))
+            print(color(f"  ✓ 已导出到: {out_path}", "green"))
+
+            if prompt_bool("  📋 同时复制所有文案到剪贴板？", False):
+                try:
+                    if os.name == "nt":
+                        import subprocess
+                        p = subprocess.Popen(["clip"], stdin=subprocess.PIPE)
+                        p.communicate(("\n".join(out_lines)).encode("utf-16-le"))
+                        print(color("    ✓ 全部文案已复制", "green"))
+                except Exception:
+                    pass
+
+    print(color("\n" + "─" * 60, "dim"))
+    print(color("  🗂️ 车头私聊登记提示", "bold", "yellow"))
+    print(color("─" * 60, "dim"))
+
+    weekday = ["一", "二", "三", "四", "五", "六", "日"][car.start_time.weekday()]
+    time_str = car.start_time.strftime(f"%m月%d日 周{weekday} %H:%M")
+    end_time = car.start_time + timedelta(hours=car.duration_hours)
+    end_str = end_time.strftime("%H:%M")
+    exp_str = f"≥{car.min_experience}个硬核本经验" if car.min_experience > 0 else "无门槛（萌新友好）"
+    loc_str = f"{car.city}·{car.shop}" if car.city else car.shop
+    regs = get_registrations_by_car(db, car.id)
+    approved_count = len([r for r in regs if r.status == "approved"])
+    pending_count = len([r for r in regs if r.status == "pending"])
+
+    grp_display = "-"
+    if car.target_group:
+        grp = get_group(db, car.target_group)
+        if grp:
+            grp_display = grp.alias or grp.name
+
+    print(f"\n车: {car.name}  ID: {car.id}  群: {grp_display}")
     print(f"时: {time_str}～{end_str}  地: {loc_str}")
     print(f"配: {car.total_players}人 {car.role_constraints or ''}  门: {exp_str}")
     if car.require_unread:
         print("要: 未读本")
     print()
     print("报名登记模板：")
-    print(f"  add {car.id}")
+    print(f"  add {car.id} -g <来源群>")
     print(f"  → 昵称 / 性别 / 可到 / 已读本? / 备注 / 经验 / 反串")
     if approved_count > 0:
         print(f"\n当前状态: {approved_count}已确认 / {pending_count}待审 / {car.total_players - approved_count}空位")
-
-    # 自动复制
-    try:
-        full_text = "\n".join(draft_lines)
-        if os.name == "nt":
-            import subprocess
-            p = subprocess.Popen(["clip"], stdin=subprocess.PIPE)
-            p.communicate(full_text.encode("utf-16-le"))
-            print(color("\nℹ️ 报名文案已复制到剪贴板", "green"))
-    except Exception:
-        pass
+    print()
 
 
 def cmd_export(db, args):
@@ -1390,20 +1818,26 @@ def cmd_export(db, args):
         print(color("  📋 车头审核表（内部用）", "bold", "yellow"))
         print(color("─" * 62, "dim"))
 
-        print(color(f"\n{'#':<3}{'昵称':<12}{'性别':<4}{'经验':<8}{'反串':<4}{'可到':<12}{'定金':<4}{'备注'}", "bold"))
-        print("-" * 78)
+        print(color(f"\n{'#':<3}{'昵称':<12}{'性别':<4}{'经验':<8}{'反串':<4}{'可到':<12}{'来源群':<8}{'定金':<4}{'备注'}", "bold"))
+        print("-" * 90)
         for i, (r, p) in enumerate(approved_pairs, 1):
             exp_s = exp_display(p.experience_count)
             cc_s = "✓" if r.effective_accept_crosscast(p) else "✗"
-            note = r.notes[:20] if r.notes else ""
+            note = r.notes[:15] if r.notes else ""
             if r.read_this_book:
-                note = ("⚠已读本 " + note)[:20]
+                note = ("⚠已读本 " + note)[:15]
             # 长期标签中的风险信息
             risk = p.risk_tags()
             if risk:
-                note = (note + " " + "⚠".join(risk))[:20]
+                note = (note + " " + "⚠".join(risk))[:15]
+            # 来源群
+            grp_str = ""
+            if r.source_group:
+                grp = get_group(db, r.source_group)
+                if grp:
+                    grp_str = (grp.alias or grp.name)[:6]
             print(f"{i:<3}{p.nickname[:10]:<12}{p.gender:<4}{exp_s:<8}{cc_s:<4}"
-                  f"{r.available_time[:10]:<12}{'□':<4}{note}")
+                  f"{r.available_time[:10]:<12}{grp_str:<8}{'□':<4}{note}")
 
         if scope == "bench" and benched_pairs:
             print(color(f"\n── 替补席 ──", "blue", "bold"))
@@ -1449,21 +1883,27 @@ def cmd_export(db, args):
         if car.require_unread:
             print(f"  要求: 全员未读本")
         print()
-        print(color(f"  {'#':<3}{'昵称':<12}{'性别':<4}{'经验':<8}{'可到时间':<14}{'备注'}", "bold"))
-        print("  " + "-" * 56)
+        print(color(f"  {'#':<3}{'昵称':<12}{'性别':<4}{'经验':<8}{'可到时间':<14}{'来源群':<8}{'备注'}", "bold"))
+        print("  " + "-" * 64)
         for i, (r, p) in enumerate(included_pairs, 1):
             exp_s = exp_display(p.experience_count)
             note_parts = []
             if r.read_this_book:
                 note_parts.append("已读本")
             if r.notes:
-                note_parts.append(r.notes[:10])
+                note_parts.append(r.notes[:8])
             rt = p.risk_tags()
             if rt:
                 note_parts.append("⚠" + "/".join(rt))
             note_str = " ".join(note_parts) if note_parts else ""
+            # 来源群
+            grp_str = ""
+            if r.source_group:
+                grp = get_group(db, r.source_group)
+                if grp:
+                    grp_str = (grp.alias or grp.name)[:6]
             print(f"  {i:<3}{p.nickname[:10]:<12}{p.gender:<4}{exp_s:<8}"
-                  f"{r.available_time[:12]:<14}{note_str}")
+                  f"{r.available_time[:12]:<14}{grp_str:<8}{note_str}")
 
         if scope == "bench" and benched_pairs:
             print(f"\n  替补: {len(benched_pairs)}人")
@@ -1513,6 +1953,7 @@ COMMANDS = {
     "players": cmd_players,
     "tag": cmd_tag,
     "template": cmd_template, "tpl": cmd_template,
+    "group": cmd_group, "grp": cmd_group,
     "help": cmd_help, "?": cmd_help, "h": cmd_help,
 }
 
