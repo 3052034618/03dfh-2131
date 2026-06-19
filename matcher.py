@@ -221,8 +221,37 @@ def check_notes_conflict(car: Car, registration: Registration, player: Player) -
     return issues
 
 
+def check_player_tags(car: Car, registration: Registration, player: Player) -> List[MatchIssue]:
+    """根据玩家长期标签自动生成提示（风险标签→warning/critical，正面标签→加分）"""
+    issues = []
+    if not player.tags:
+        return issues
+    # 高风险标签 -> critical
+    high_risk = ["跳车", "天眼", "鸽子"]
+    for tag in player.tags:
+        if any(k in tag for k in high_risk):
+            issues.append(MatchIssue(
+                "tag_risk",
+                f"长期标签⚠️【{tag}】需格外留意（来自玩家资料库）",
+                "critical" if any(k in tag for k in ("跳车", "天眼")) else "warning",
+            ))
+        elif any(k in tag for k in ("迟到", "挂机", "杠精", "剧透")):
+            issues.append(MatchIssue(
+                "tag_risk",
+                f"长期标签【{tag}】需留意（来自玩家资料库）",
+                "warning",
+            ))
+    return issues
+
+
 def analyze_match(car: Car, registration: Registration, player: Player) -> MatchResult:
     result = MatchResult(registration, player)
+
+    # 正面标签 -> 基础加分
+    if player.tags:
+        good = player.good_tags()
+        if good:
+            result.severity_score -= len(good) * 2  # 扣减severity_score相当于加分
 
     checks = [
         check_book_read_rule,
@@ -230,6 +259,7 @@ def analyze_match(car: Car, registration: Registration, player: Player) -> Match
         check_time_match,
         check_experience,
         check_notes_conflict,
+        check_player_tags,  # ✅ v1.2：加入长期标签检查
     ]
     for check_fn in checks:
         for issue in check_fn(car, registration, player):

@@ -41,6 +41,7 @@ def _migrate_old_data(data: dict) -> Database:
         p.setdefault("past_hardcore_books", "")
         p.setdefault("accept_crosscast", False)
         p.setdefault("experience_count", 0)
+        p.setdefault("tags", [])  # ✅ v1.2：tags 默认空列表
         try:
             migrated_players.append(Player(**p))
         except TypeError as e:
@@ -288,3 +289,37 @@ def delete_template(db: Database, template_id: str) -> bool:
     db.templates = [t for t in db.templates if t.id != template_id and t.name != template_id]
     save_db(db)
     return len(db.templates) < before
+
+
+# ---------- Player Tags（长期标签） ----------
+
+PRESET_TAGS = [
+    # 正面标签
+    "靠谱", "老炮", "大神", "推土机", "宝藏玩家", "输出担当", "氛围组",
+    # 风险标签
+    "易迟到", "常迟到", "跳车", "鸽子", "天眼风险", "剧透", "挂机", "杠精",
+    # 中性
+    "萌新友好", "社恐", "社牛", "情感偏好", "硬核偏好",
+]
+
+
+def add_player_tag(db: Database, player_id: str, tag: str) -> bool:
+    p = get_player(db, player_id)
+    if not p:
+        return False
+    p.add_tag(tag)
+    save_db(db)
+    return True
+
+
+def remove_player_tag(db: Database, player_id: str, tag: str) -> bool:
+    p = get_player(db, player_id)
+    if not p:
+        return False
+    p.remove_tag(tag)
+    save_db(db)
+    return True
+
+
+def list_players_by_tag(db: Database, tag: str) -> List[Player]:
+    return [p for p in db.players if p.has_tag(tag)]

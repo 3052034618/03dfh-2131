@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-硬核推理车队招募助手 - Hardcore Car Manager v1.1
-面向资深车头的极简命令行工具
+硬核推理车队招募助手 - Hardcore Car Manager v1.2
+面向资深车头的极简命令行工具（长期多群发车工作台）
 """
 
 import sys
 import os
 import re
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any
 
 from models import Car, Player, Registration, CarTemplate
 from storage import (
@@ -20,39 +20,45 @@ from storage import (
     get_player_registrations,
     update_registration_status,
     add_template, get_template, list_templates, delete_template,
+    add_player_tag, remove_player_tag, list_players_by_tag, PRESET_TAGS,
 )
 from matcher import triage_registrations, MatchResult
 
 
 BANNER = r"""
 ╔══════════════════════════════════════════╗
-║  🔥 硬核推理车队招募助手 v1.1 🔥         ║
+║  🔥 硬核推理车队招募助手 v1.2 🔥         ║
 ║  Hardcore Detective Car Manager         ║
-║  为资深车头 · 极简高效组局              ║
+║  长期多群发车 · 工作台版                ║
 ╚══════════════════════════════════════════╝
 """
 
 HELP = """
 命令列表：
   new [-t 模板名]        开新车（可用 -t 直接套用模板）
-  add <车ID>             为指定车添加报名（同昵称不同车互不影响）
-  view <车ID> [选项]     查看报名三段式分析
+  copy <车ID>            从已有车复制出新车（可改时间/店铺/群）
+  add <车ID>             为指定车添加报名（含玩家长期标签录入）
+  view <车ID> [选项]     查看报名三段式分析（支持屏幕内直接批量审核）
        筛选选项： --pending   仅未处理
                   --eligible  仅可进正车（无严重冲突）
                   --approved  仅已确认
                   --bench     仅替补
                   --conflict  仅严重冲突
        排序选项： --sort score|experience|time|created
-       （不带选项时会弹出交互式筛选/排序菜单）
-  export <车ID>          导出微信群公告 + 车头确认清单（自动复制剪贴板）
+       （不带选项时会弹出交互式筛选/排序/批量审核菜单）
+  export <车ID> [格式] [范围]
+       格式: all(默认) / notice(群公告) / check(审核表) / shop(店铺表)
+       范围: approved(仅已确认) / bench(已确认+替补)
   list                   列出所有车辆
+  draft <车ID>           生成多群报名文案 + 车头私聊登记提示草稿
   status <车ID> <open|full|done|cancel>
   approve <车ID> <序号...>   批量确认入队
   bench   <车ID> <序号...>   批量设为替补
   kick    <车ID> <序号...>   批量移除
-  info <车ID>            车辆详情
+  info <车ID>            车辆详情（带长期标签显示）
   del <车ID>             删除车辆
-  players                玩家资料库（所有登记过的玩家）
+  players [标签]         玩家资料库（可按标签筛选）
+  tag <玩家昵称> +/-<标签>  给玩家加/减长期标签（如 tag 小明 +靠谱 -易迟到）
   template save <模板名> [车ID]   保存配置为模板（默认从最新车）
   template list                 列出所有模板
   template del <模板名/ID>       删除模板
@@ -61,10 +67,13 @@ HELP = """
 
 使用示例：
   > new -t "周末硬核标配"
+  > copy ab12cd34                      # 复制车，改时间店铺
   > add ab12cd34
   > view ab12cd34 --pending --sort experience
+  > view ab12cd34                      # 进入交互式，直接 a1-6 批量 approve
   > approve ab12cd34 1 3 5 7 8 10
-  > export ab12cd34
+  > export ef56gh78 notice approved    # 仅导出群公告+已确认
+  > players 跳车                        # 筛出所有有「跳车」标签的玩家
 """
 
 
@@ -181,6 +190,46 @@ def exp_display(n: int) -> str:
     if n <= 0:
         return "萌新"
     return f"{n}硬核"
+
+
+def tags_display(player: Player, max_len: int = 40) -> str:
+    """标签友好显示，风险类红色、正面绿色、中性灰色"""
+    if not player.tags:
+        return ""
+    parts = []
+    for t in player.tags:
+        if any(k in t for k in ("跳车", "天眼", "鸽子")):
+            parts.append(color(f"⚠{t}", "red"))
+        elif any(k in t for k in ("迟到", "挂机", "杠精", "剧透")):
+            parts.append(color(f"△{t}", "yellow"))
+        elif any(k in t for k in ("靠谱", "老炮", "大神", "推土机", "宝藏", "输出", "氛围")):
+            parts.append(color(f"✓{t}", "green"))
+        else:
+            parts.append(color(f"·{t}", "dim"))
+    s = " ".join(parts)
+    return s[:max_len]
+
+
+def parse_index_ranges(text: str) -> List[int]:
+    """解析 '1,3,5-8,10' 这样的序号范围，返回去重排序的整数列表"""
+    result = set()
+    if not text:
+        return []
+    for part in re.split(r"[,，\s]+", text.strip()):
+        if not part:
+            continue
+        m = re.match(r"^(\d+)\s*[-~—]\s*(\d+)$", part)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            lo, hi = min(a, b), max(a, b)
+            for i in range(lo, hi + 1):
+                result.add(i)
+        else:
+            try:
+                result.add(int(part))
+            except ValueError:
+                continue
+    return sorted(result)
 
 
 # =====================================================
@@ -453,6 +502,29 @@ def cmd_add(db, args):
         exp_count = 0
     accept_cc_default = prompt_bool("【长期】通常是否接受反串", default=False)
 
+    # ------- 【长期】标签 -------
+    print(color("  【长期】标签预设(用数字选，可多个逗号分隔，也可手动输入；留空跳过)：", "dim"))
+    preset_line = "  " + "  ".join(f"{i+1}.{t}" for i, t in enumerate(PRESET_TAGS[:10]))
+    print(preset_line)
+    print("  11-20: " + " ".join(PRESET_TAGS[10:]))
+    tags_input = prompt(
+        "【长期】玩家标签（如: 1,3,靠谱 或直接输入标签）",
+        required=False,
+    )
+    initial_tags = []
+    if tags_input:
+        for piece in re.split(r"[,，\s]+", tags_input.strip()):
+            if not piece:
+                continue
+            if piece.isdigit():
+                idx = int(piece) - 1
+                if 0 <= idx < len(PRESET_TAGS):
+                    initial_tags.append(PRESET_TAGS[idx])
+            else:
+                initial_tags.append(piece)
+    # 去重
+    initial_tags = list(dict.fromkeys(initial_tags))
+
     # ------- 确定玩家实体 -------
     existing_player = find_player_by_nickname(db, nickname)
     reuse = False
@@ -481,6 +553,15 @@ def cmd_add(db, args):
         if accept_cc_default != player.accept_crosscast:
             player.accept_crosscast = accept_cc_default
             changed = True
+        # 标签合并
+        if initial_tags:
+            old_tags_set = set(player.tags or [])
+            new_added = [t for t in initial_tags if t not in old_tags_set]
+            if new_added:
+                print(color(f"  ℹ️  本次将为玩家追加标签: {' '.join(new_added)}", "dim"))
+                for t in new_added:
+                    player.add_tag(t)
+                changed = True
         if changed:
             save_db(db)
     else:
@@ -489,6 +570,7 @@ def cmd_add(db, args):
             past_hardcore_books=past_books,
             accept_crosscast=accept_cc_default,
             experience_count=exp_count,
+            tags=initial_tags,
         )
         add_player(db, player)
 
@@ -508,6 +590,9 @@ def cmd_add(db, args):
     cc_str = "接受反串" if reg.effective_accept_crosscast(player) else "不反串"
     print(color(f"\n✓ 本次报名登记成功！", "green"))
     print(f"  玩家: {player.nickname} ({player.gender} · 累计{exp_display(player.experience_count)})")
+    td = tags_display(player)
+    if td:
+        print(f"  标签: {td}")
     print(f"  本次: 可到{reg.available_time} · "
           f"{'已读本⚠️' if reg.read_this_book else '未读本✓'} · "
           f"{cc_str}")
@@ -520,18 +605,69 @@ def cmd_add(db, args):
 # =====================================================
 
 def cmd_players(db, args):
-    if not db.players:
+    players = db.players
+    if not players:
         print(color("! 资料库暂无玩家", "yellow"))
         return
-    print(color(f"\n{'昵称':14} {'性别':<4} {'经验':<8} {'反串':<4} {'报名次数':<8} 履历", "bold"))
-    print("-" * 78)
-    for p in sorted(db.players, key=lambda x: x.experience_count, reverse=True):
+    # 按标签筛选
+    if args:
+        tag_filter = " ".join(args).strip()
+        players = [p for p in players if tag_filter in (p.tags or []) or
+                   any(tag_filter in t for t in (p.tags or []))]
+        if not players:
+            print(color(f"! 没有含标签「{tag_filter}」的玩家", "yellow"))
+            return
+        print(color(f"🔍 筛选标签「{tag_filter}」，共 {len(players)} 名玩家：", "cyan", "bold"))
+    print(color(f"\n{'昵称':14} {'性别':<4} {'经验':<8} {'反串':<4} {'报名':<6} 标签", "bold"))
+    print("-" * 82)
+    for p in sorted(players, key=lambda x: (len(x.risk_tags()) > 0, -x.experience_count)):
         regs = get_player_registrations(db, p.id)
         cc = "✓" if p.accept_crosscast else "✗"
-        books = (p.past_hardcore_books or "")[:30]
+        td = tags_display(p, max_len=60) or color("（无标签）", "dim")
         print(f"{p.nickname[:14]:14} {p.gender:<4} {exp_display(p.experience_count):<8} "
-              f"{cc:<4} {len(regs):<8} {books}")
-    print(f"\n共 {len(db.players)} 名玩家在库")
+              f"{cc:<4} {len(regs):<6} {td}")
+    print(f"\n共 {len(players)} 名玩家")
+
+
+def cmd_tag(db, args):
+    """tag <玩家昵称> +/-<标签> ..."""
+    if len(args) < 2:
+        print(color("! 用法：tag <玩家昵称> +/-<标签> [+/-<标签>...]", "red"))
+        print("  示例：tag 小明 +靠谱 -易迟到 +推土机")
+        return
+    nickname = args[0]
+    player = find_player_by_nickname(db, nickname)
+    if not player:
+        # 尝试模糊匹配
+        matches = [p for p in db.players if nickname.lower() in p.nickname.lower()]
+        if len(matches) == 1:
+            player = matches[0]
+            print(color(f"ℹ️  匹配到玩家：{player.nickname}", "dim"))
+        else:
+            print(color(f"! 未找到玩家：{nickname}", "red"))
+            return
+    changed = False
+    for tok in args[1:]:
+        if not tok:
+            continue
+        if tok.startswith("+") or tok.startswith("＋"):
+            tag = tok[1:].strip()
+            if tag:
+                player.add_tag(tag)
+                print(color(f"  ✓ 已加标签：{tag}", "green"))
+                changed = True
+        elif tok.startswith("-") or tok.startswith("－"):
+            tag = tok[1:].strip()
+            if tag and player.has_tag(tag):
+                player.remove_tag(tag)
+                print(color(f"  ✓ 已去标签：{tag}", "yellow"))
+                changed = True
+        else:
+            print(color(f"  ! 忽略：{tok}（请用 +标签 / -标签）", "yellow"))
+    if changed:
+        save_db(db)
+        td = tags_display(player)
+        print(f"  最新标签: {td or color('（无）', 'dim')}")
 
 
 # =====================================================
