@@ -3,7 +3,6 @@ from datetime import datetime
 import re
 
 from models import Car, Player, Registration
-from storage import get_player
 
 
 class MatchIssue:
@@ -47,7 +46,7 @@ class MatchResult:
             base += 20
         elif self.player.experience_count >= 3:
             base += 10
-        if self.player.accept_crosscast:
+        if self.registration.effective_accept_crosscast(self.player):
             base += 5
         return base - self.severity_score
 
@@ -66,7 +65,7 @@ def _parse_time_availability(avail_str: str) -> Tuple[int, int]:
     text = avail_str.strip()
 
     m = re.search(
-        r"(\d{1,2})(?:[:：点](\d{1,2}))?\s*(?:~|～|-|—|到|至|\-)\s*(\d{1,2})(?:[:：点](\d{1,2}))?",
+        r"(\d{1,2})(?:[:：点](\d{0,2}))?\s*(?:~|～|-|—|到|至|\-)\s*(\d{1,2})(?:[:：点](\d{0,2}))?",
         text,
     )
     if m:
@@ -110,13 +109,13 @@ def _parse_time_availability(avail_str: str) -> Tuple[int, int]:
     return (-1, -1)
 
 
-def check_time_match(car: Car, player: Player) -> List[MatchIssue]:
+def check_time_match(car: Car, registration: Registration, player: Player) -> List[MatchIssue]:
     issues = []
-    avail_min, avail_max = _parse_time_availability(player.available_time)
+    avail_min, avail_max = _parse_time_availability(registration.available_time)
     if avail_min < 0:
         issues.append(MatchIssue(
             "time",
-            f"可到时间「{player.available_time}」无法自动解析，请人工核对",
+            f"可到时间「{registration.available_time}」无法自动解析，请人工核对",
             "warning"
         ))
         return issues
@@ -142,7 +141,7 @@ def check_time_match(car: Car, player: Player) -> List[MatchIssue]:
     return issues
 
 
-def check_gender_role_match(car: Car, player: Player) -> List[MatchIssue]:
+def check_gender_role_match(car: Car, registration: Registration, player: Player) -> List[MatchIssue]:
     issues = []
     constraints = (car.role_constraints or "").strip()
     if not constraints:
@@ -150,40 +149,36 @@ def check_gender_role_match(car: Car, player: Player) -> List[MatchIssue]:
 
     const_lower = constraints
     gender = (player.gender or "").strip()
+    accept_cc = registration.effective_accept_crosscast(player)
 
     has_male_role = "男" in const_lower or "♂" in const_lower
     has_female_role = "女" in const_lower or "♀" in const_lower
 
-    require_no_crosscast = any(k in const_lower for k in ["不接受反串", "禁止反串", "不可反串", "严禁反串"])
     strict_male_only = any(k in const_lower for k in ["必须男", "必男", "硬性要求男", "需男"])
     strict_female_only = any(k in const_lower for k in ["必须女", "必女", "硬性要求女", "需女"])
     only_male_roles = has_male_role and not has_female_role
     only_female_roles = has_female_role and not has_male_role
 
-    if (strict_male_only or only_male_roles) and gender != "男" and not player.accept_crosscast:
+    if (strict_male_only or only_male_roles) and gender != "男" and not accept_cc:
         sev = "critical" if strict_male_only else "warning"
         issues.append(MatchIssue(
             "role",
             f"本车配置「{constraints}」需男性，玩家{player.nickname}性别{gender}且不接受反串",
             sev
         ))
-    elif (strict_female_only or only_female_roles) and gender != "女" and not player.accept_crosscast:
+    elif (strict_female_only or only_female_roles) and gender != "女" and not accept_cc:
         sev = "critical" if strict_female_only else "warning"
         issues.append(MatchIssue(
             "role",
             f"本车配置「{constraints}」需女性，玩家{player.nickname}性别{gender}且不接受反串",
             sev
         ))
-    elif require_no_crosscast:
-        other_gender_roles = has_female_role if gender == "男" else has_male_role
-        if not player.accept_crosscast and other_gender_roles:
-            pass
     return issues
 
 
-def check_book_read_rule(car: Car, player: Player) -> List[MatchIssue]:
+def check_book_read_rule(car: Car, registration: Registration, player: Player) -> List[MatchIssue]:
     issues = []
-    if car.require_unread and player.read_this_book:
+    if car.require_unread and registration.read_this_book:
         issues.append(MatchIssue(
             "book",
             f"本车要求未读本，玩家{player.nickname}已读本《{car.name}》",
@@ -192,20 +187,21 @@ def check_book_read_rule(car: Car, player: Player) -> List[MatchIssue]:
     return issues
 
 
-def check_experience(car: Car, player: Player) -> List[MatchIssue]:
+def check_experience(car: Car, registration: Registration, player: Player) -> List[MatchIssue]:
     issues = []
     if car.min_experience > 0 and player.experience_count < car.min_experience:
+        exp_str = f"{player.experience_count}个" if player.experience_count > 0 else "0个（萌新）"
         issues.append(MatchIssue(
             "experience",
-            f"本车要求≥{car.min_experience}个硬核本经验，玩家仅{player.experience_count}个",
+            f"本车要求≥{car.min_experience}个硬核本经验，玩家仅{exp_str}",
             "warning"
         ))
     return issues
 
 
-def check_notes_conflict(car: Car, player: Player) -> List[MatchIssue]:
+def check_notes_conflict(car: Car, registration: Registration, player: Player) -> List[MatchIssue]:
     issues = []
-    if not player.notes:
+    if not registration.notes:
         return issues
 
     trigger_words = [
@@ -216,63 +212,83 @@ def check_notes_conflict(car: Car, player: Player) -> List[MatchIssue]:
         ("杠精", "有抬杠倾向"),
         ("社交", "社恐/社牛描述需确认气氛匹配"),
         ("情感", "偏好情感本，硬核对其可能较吃力"),
+        ("鸽子", "有放鸽子记录"),
     ]
     for keyword, desc in trigger_words:
-        if keyword in player.notes:
-            sev = "critical" if keyword in ("跳车", "天眼") else "warning"
+        if keyword in registration.notes:
+            sev = "critical" if keyword in ("跳车", "天眼", "鸽子") else "warning"
             issues.append(MatchIssue("notes", f"备注雷点「{keyword}」：{desc}", sev))
     return issues
 
 
 def analyze_match(car: Car, registration: Registration, player: Player) -> MatchResult:
     result = MatchResult(registration, player)
-    for issue in check_book_read_rule(car, player):
-        result.issues.append(issue)
-        if issue.severity == "critical":
-            result.severity_score += 100
-        elif issue.severity == "warning":
-            result.severity_score += 10
-    for issue in check_gender_role_match(car, player):
-        result.issues.append(issue)
-        if issue.severity == "critical":
-            result.severity_score += 100
-        elif issue.severity == "warning":
-            result.severity_score += 10
-    for issue in check_time_match(car, player):
-        result.issues.append(issue)
-        if issue.severity == "critical":
-            result.severity_score += 100
-        elif issue.severity == "warning":
-            result.severity_score += 10
-    for issue in check_experience(car, player):
-        result.issues.append(issue)
-        if issue.severity == "critical":
-            result.severity_score += 100
-        elif issue.severity == "warning":
-            result.severity_score += 10
-    for issue in check_notes_conflict(car, player):
-        result.issues.append(issue)
-        if issue.severity == "critical":
-            result.severity_score += 100
-        elif issue.severity == "warning":
-            result.severity_score += 10
+
+    checks = [
+        check_book_read_rule,
+        check_gender_role_match,
+        check_time_match,
+        check_experience,
+        check_notes_conflict,
+    ]
+    for check_fn in checks:
+        for issue in check_fn(car, registration, player):
+            result.issues.append(issue)
+            if issue.severity == "critical":
+                result.severity_score += 100
+            elif issue.severity == "warning":
+                result.severity_score += 10
+            else:
+                result.severity_score += 1
     return result
 
 
-def triage_registrations(db, car: Car, registrations: List[Registration]) -> Dict[str, List[MatchResult]]:
+def triage_registrations(db, car: Car, registrations: List[Registration],
+                         filter_status: str = "all",
+                         sort_by: str = "score") -> Dict[str, List[MatchResult]]:
+    """
+    分诊 + 筛选 + 排序
+    filter_status: all / pending / eligible（可进正车，无critical）/ approved / bench
+    sort_by: score / experience / time / created
+    """
+    from storage import get_player
+
     results = []
     for reg in registrations:
         player = get_player(db, reg.player_id)
-        if player:
-            results.append(analyze_match(car, reg, player))
+        if not player:
+            continue
+        results.append(analyze_match(car, reg, player))
 
+    # --- 筛选 ---
+    if filter_status == "pending":
+        results = [r for r in results if r.registration.status == "pending"]
+    elif filter_status == "eligible":
+        results = [r for r in results if not r.has_critical]
+    elif filter_status == "approved":
+        results = [r for r in results if r.registration.status == "approved"]
+    elif filter_status == "bench":
+        results = [r for r in results if r.registration.status == "bench"]
+    elif filter_status == "conflict":
+        results = [r for r in results if r.has_critical]
+
+    # --- 排序 ---
+    def _time_key(r: MatchResult) -> int:
+        mn, _ = _parse_time_availability(r.registration.available_time)
+        return mn if mn >= 0 else 99999
+
+    if sort_by == "experience":
+        results.sort(key=lambda r: r.player.experience_count, reverse=True)
+    elif sort_by == "time":
+        results.sort(key=_time_key)
+    elif sort_by == "created":
+        results.sort(key=lambda r: r.registration.created_at)
+    else:  # score（默认）
+        results.sort(key=lambda r: r.match_score, reverse=True)
+
+    # --- 三段式 ---
     conflict = [r for r in results if r.has_critical]
-    conflict.sort(key=lambda x: x.severity_score, reverse=True)
-
     warning = [r for r in results if not r.has_critical and r.has_warning]
-    warning.sort(key=lambda x: x.severity_score, reverse=True)
-
     match = [r for r in results if not r.has_critical and not r.has_warning]
-    match.sort(key=lambda x: x.match_score, reverse=True)
 
-    return {"conflict": conflict, "warning": warning, "match": match}
+    return {"conflict": conflict, "warning": warning, "match": match, "all": results}

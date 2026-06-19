@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-硬核推理车队招募助手 - Hardcore Car Manager
+硬核推理车队招募助手 - Hardcore Car Manager v1.1
 面向资深车头的极简命令行工具
 """
 
@@ -9,22 +9,24 @@ import sys
 import os
 import re
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Tuple
 
-from models import Car, Player, Registration
+from models import Car, Player, Registration, CarTemplate
 from storage import (
     load_db, save_db,
     add_car, get_car, list_cars, update_car_status, delete_car,
-    add_player, get_player, find_player_by_nickname,
+    add_player, get_player, find_player_by_nickname, update_player,
     add_registration, remove_registration, get_registrations_by_car,
+    get_player_registrations,
     update_registration_status,
+    add_template, get_template, list_templates, delete_template,
 )
 from matcher import triage_registrations, MatchResult
 
 
 BANNER = r"""
 ╔══════════════════════════════════════════╗
-║  🔥 硬核推理车队招募助手 v1.0 🔥         ║
+║  🔥 硬核推理车队招募助手 v1.1 🔥         ║
 ║  Hardcore Detective Car Manager         ║
 ║  为资深车头 · 极简高效组局              ║
 ╚══════════════════════════════════════════╝
@@ -32,33 +34,37 @@ BANNER = r"""
 
 HELP = """
 命令列表：
-  new [car_id]        开新车 / 创建新剧本杀局（交互式输入）
-  add <car_id>        为指定车添加报名玩家（交互式录入）
-  view <car_id>       查看该车报名三段式分析（冲突 / 不符 / 匹配）
-  export <car_id>     导出微信群公告 + 确认名单（剪贴板格式）
-  list                列出所有车辆
-  status <car_id> <open|full|done|cancel>
-                      修改车辆状态
-  approve <car_id> <index> [more...]
-                      将 view 显示的序号标记为确认入队
-  bench <car_id> <index> [more...]
-                      将序号标记为替补
-  kick <car_id> <index> [more...]
-                      从报名中移除指定玩家
-  info <car_id>       查看车辆详细信息
-  del <car_id>        删除车辆（连同其报名记录）
-  help / ?            显示此帮助
-  quit / exit / q     退出程序
+  new [-t 模板名]        开新车（可用 -t 直接套用模板）
+  add <车ID>             为指定车添加报名（同昵称不同车互不影响）
+  view <车ID> [选项]     查看报名三段式分析
+       筛选选项： --pending   仅未处理
+                  --eligible  仅可进正车（无严重冲突）
+                  --approved  仅已确认
+                  --bench     仅替补
+                  --conflict  仅严重冲突
+       排序选项： --sort score|experience|time|created
+       （不带选项时会弹出交互式筛选/排序菜单）
+  export <车ID>          导出微信群公告 + 车头确认清单（自动复制剪贴板）
+  list                   列出所有车辆
+  status <车ID> <open|full|done|cancel>
+  approve <车ID> <序号...>   批量确认入队
+  bench   <车ID> <序号...>   批量设为替补
+  kick    <车ID> <序号...>   批量移除
+  info <车ID>            车辆详情
+  del <车ID>             删除车辆
+  players                玩家资料库（所有登记过的玩家）
+  template save <模板名> [车ID]   保存配置为模板（默认从最新车）
+  template list                 列出所有模板
+  template del <模板名/ID>       删除模板
+  help / ?               显示此帮助
+  quit / exit / q        退出
 
 使用示例：
-  > new
-  （按提示填写本名、人数等信息）
+  > new -t "周末硬核标配"
   > add ab12cd34
-  （按提示填写玩家昵称、性别等）
-  > view ab12cd34
-  （看到三段列表，根据序号做 approve/bench/kick）
+  > view ab12cd34 --pending --sort experience
+  > approve ab12cd34 1 3 5 7 8 10
   > export ab12cd34
-  （直接复制输出的群公告内容即可）
 """
 
 
@@ -88,7 +94,11 @@ def prompt(msg: str, default=None, required=True, validator=None):
             print(color("  ! 必填项，不能为空", "red"))
             continue
         if validator:
-            ok, err = validator(val)
+            result = validator(val)
+            if isinstance(result, tuple):
+                ok, err = result
+            else:
+                ok, err = result, ""
             if not ok:
                 print(color(f"  ! {err}", "red"))
                 continue
@@ -108,17 +118,31 @@ def prompt_bool(msg: str, default: bool = False) -> bool:
         print(color("  ! 请输入 y 或 n", "red"))
 
 
-def v_int(text):
+# ===== 验证器：区分"必须正整数"和"允许0的非负整数" =====
+
+def v_int_pos(text):
+    """必须 > 0 的正整数（用于人数、时长等）"""
     try:
         n = int(text)
         if n > 0:
             return True, ""
-        return False, "必须是正整数"
+        return False, "必须是正整数（不能为0或负数）"
     except ValueError:
         return False, "请输入有效整数"
 
 
-def v_float(text):
+def v_int_nonneg(text):
+    """允许为 0 的非负整数（用于经验门槛、经验数量等）"""
+    try:
+        n = int(text)
+        if n >= 0:
+            return True, ""
+        return False, "必须是非负整数（0 或正整数）"
+    except ValueError:
+        return False, "请输入有效整数（0 表示无门槛/萌新）"
+
+
+def v_float_pos(text):
     try:
         n = float(text)
         if n > 0:
@@ -152,18 +176,154 @@ def v_gender(text):
     return False, "请输入 男 / 女"
 
 
-def cmd_new(db, _):
+def exp_display(n: int) -> str:
+    """经验数量的友好显示：0=萌新，其它=N硬核"""
+    if n <= 0:
+        return "萌新"
+    return f"{n}硬核"
+
+
+# =====================================================
+#  模板命令
+# =====================================================
+
+def cmd_template(db, args):
+    if not args:
+        print(color("! 用法：template <save|list|del> ...", "red"))
+        return
+    sub = args[0].lower()
+    if sub == "list":
+        _cmd_template_list(db)
+    elif sub == "save":
+        _cmd_template_save(db, args[1:])
+    elif sub in ("del", "rm", "delete", "remove"):
+        _cmd_template_del(db, args[1:])
+    else:
+        print(color(f"! 未知子命令 template {sub}", "red"))
+
+
+def _cmd_template_list(db):
+    templates = list_templates(db)
+    if not templates:
+        print(color("! 暂无模板，用 template save <名称> [车ID] 创建", "yellow"))
+        return
+    print(color(f"\n{'ID':10} {'模板名':20} {'人数':>4} {'时长':>5} {'地点':16} {'门槛':8}", "bold"))
+    print("-" * 72)
+    for t in templates:
+        loc = f"{t.city}·{t.shop}"
+        exp = f"≥{t.min_experience}硬核" if t.min_experience > 0 else "无门槛"
+        unread = "未读本✓" if t.require_unread else ""
+        print(f"{t.id:10} {t.name[:20]:20} {t.total_players:>4} "
+              f"{t.duration_hours:>4.1f}h {loc[:16]:16} {exp} {unread}")
+        if t.role_constraints:
+            print(f"           {color('🎭 ' + t.role_constraints, 'dim')}")
+    print()
+
+
+def _cmd_template_save(db, args):
+    if not args:
+        print(color("! 用法：template save <模板名> [车ID]", "red"))
+        return
+    name = args[0]
+    car = None
+    if len(args) >= 2:
+        car = _get_car_or_error(db, args[1])
+        if not car:
+            return
+    else:
+        # 默认用最近创建的车
+        cars = list_cars(db)
+        if cars:
+            car = cars[0]
+            print(color(f"ℹ️  将使用最近创建的车：{car.name} ({car.id})", "dim"))
+        else:
+            print(color("! 暂无车辆可用来保存模板", "yellow"))
+            return
+
+    # 如果模板名已存在，提示是否覆盖
+    existing = get_template(db, name)
+    if existing:
+        if not prompt_bool(f"模板「{name}」已存在，是否覆盖？", False):
+            return
+        delete_template(db, existing.id)
+
+    template = CarTemplate.create(
+        name=name,
+        total_players=car.total_players,
+        duration_hours=car.duration_hours,
+        city=car.city,
+        shop=car.shop,
+        role_constraints=car.role_constraints,
+        require_unread=car.require_unread,
+        min_experience=car.min_experience,
+    )
+    add_template(db, template)
+    print(color(f"✓ 模板「{name}」已保存（ID: {template.id}）", "green"))
+    print(color("  下次可直接用：new -t " + name, "dim"))
+
+
+def _cmd_template_del(db, args):
+    if not args:
+        print(color("! 用法：template del <模板名或ID>", "red"))
+        return
+    target = args[0]
+    tpl = get_template(db, target)
+    if not tpl:
+        print(color(f"! 未找到模板：{target}", "red"))
+        return
+    if not prompt_bool(f"确认删除模板「{tpl.name}」？", False):
+        return
+    if delete_template(db, tpl.id):
+        print(color(f"✓ 已删除模板：{tpl.name}", "green"))
+
+
+# =====================================================
+#  新车命令（支持模板套用）
+# =====================================================
+
+def cmd_new(db, args):
+    template_id = None
+    template = None
+    # 解析 -t 参数
+    i = 0
+    while i < len(args):
+        if args[i] in ("-t", "--template") and i + 1 < len(args):
+            tpl_name = args[i + 1]
+            template = get_template(db, tpl_name)
+            if not template:
+                print(color(f"! 未找到模板：{tpl_name}", "red"))
+                print(color("  用 template list 查看所有可用模板", "dim"))
+                return
+            template_id = template.id
+            print(color(f"✓ 套用模板：{template.name}", "green"))
+            i += 2
+        else:
+            i += 1
+
     print(color("\n=== 开新车 / 新建组局 ===", "bold", "cyan"))
-    print("请依次填写以下信息（留空使用默认值）\n")
+    print("请依次填写以下信息（留空使用默认值 / 模板值）\n")
+
+    defaults = template or type('X', (), {
+        'total_players': 6, 'duration_hours': 5.0,
+        'city': '', 'shop': '',
+        'role_constraints': '', 'require_unread': True, 'min_experience': 0,
+    })()
+
     name = prompt("本名 / 剧本名称", required=True)
-    total_players = int(prompt("玩家总人数", default=6, validator=v_int))
-    duration_hours = float(prompt("预计时长（小时）", default=5.0, validator=v_float))
-    city = prompt("城市", required=True)
-    shop = prompt("店铺名称", required=True)
+    total_players = int(prompt(
+        "玩家总人数", default=defaults.total_players, validator=v_int_pos,
+    ))
+    duration_hours = float(prompt(
+        "预计时长（小时）", default=defaults.duration_hours, validator=v_float_pos,
+    ))
+    city = prompt("城市", default=defaults.city or None, required=True)
+    shop = prompt("店铺名称", default=defaults.shop or None, required=True)
 
     start_dt = None
     while start_dt is None:
-        raw = prompt("开车时间", default=datetime.now().strftime("%Y-%m-%d 19:00"))
+        default_time = datetime.now() + timedelta(days=1)
+        default_time = default_time.replace(hour=19, minute=0, second=0, microsecond=0)
+        raw = prompt("开车时间", default=default_time.strftime("%Y-%m-%d 19:00"))
         ok, result = v_datetime(raw)
         if ok:
             start_dt = result
@@ -171,17 +331,23 @@ def cmd_new(db, _):
             print(color(f"  ! {result}", "red"))
 
     role_constraints = prompt(
-        "角色性别配置（如 3男3女/4男3女，或「必男1不接受反串」等详细描述）",
-        default="", required=False
+        "角色性别配置（如 3男3女，或「必男1不接受反串」，可留空）",
+        default=defaults.role_constraints or "", required=False,
     )
-    require_unread = prompt_bool("是否要求所有人未读本（防天眼/剧透）", default=True)
-    min_exp = int(prompt("最低硬核本经验数量（0=无门槛）", default=0, validator=v_int))
+    require_unread = prompt_bool(
+        "是否要求所有人未读本（防天眼/剧透）",
+        default=defaults.require_unread,
+    )
+    min_exp = int(prompt(
+        "最低硬核本经验（0=无门槛/萌新可进）",
+        default=defaults.min_experience, validator=v_int_nonneg,
+    ))
 
     car = Car.create(
         name=name, total_players=total_players, duration_hours=duration_hours,
         city=city, shop=shop, start_time=start_dt,
         role_constraints=role_constraints, require_unread=require_unread,
-        min_experience=min_exp,
+        min_experience=min_exp, template_id=template_id,
     )
     add_car(db, car)
 
@@ -194,16 +360,39 @@ def cmd_new(db, _):
         print(f"  配置: {car.role_constraints}")
     if car.require_unread:
         print(f"  要求: 未读本 ✓")
-    if car.min_experience:
+    if car.min_experience > 0:
         print(f"  门槛: ≥{car.min_experience}个硬核本经验")
-    print(color(f"\n  请牢记车辆ID，后续添加玩家用：add {car.id}", "dim"))
+    else:
+        print(f"  门槛: 无门槛（萌新也可进）")
+    if template:
+        print(color(f"  （来源模板: {template.name}）", "dim"))
+    print(color(f"\n  添加玩家：add {car.id}", "dim"))
+
+    if prompt_bool("\n  将此配置保存为模板，下次可直接套用？", False):
+        tpl_name = prompt("模板名称（如 周末5h标配）", required=True)
+        existing = get_template(db, tpl_name)
+        if existing and not prompt_bool(f"模板「{tpl_name}」已存在，覆盖？", False):
+            return car
+        if existing:
+            delete_template(db, existing.id)
+        tpl = CarTemplate.create(
+            name=tpl_name, total_players=car.total_players,
+            duration_hours=car.duration_hours, city=car.city, shop=car.shop,
+            role_constraints=car.role_constraints,
+            require_unread=car.require_unread, min_experience=car.min_experience,
+        )
+        add_template(db, tpl)
+        print(color(f"✓ 模板已保存：{tpl.name} (ID: {tpl.id})", "green"))
     return car
 
+
+# =====================================================
+#  工具函数
+# =====================================================
 
 def _get_car_or_error(db, car_id):
     car = get_car(db, car_id)
     if not car:
-        # 尝试按名称模糊匹配
         matches = [c for c in db.cars if car_id.lower() in c.name.lower()]
         if len(matches) == 1:
             return matches[0]
@@ -217,6 +406,10 @@ def _get_car_or_error(db, car_id):
     return car
 
 
+# =====================================================
+#  添加报名（玩家资料与单次报名分离）
+# =====================================================
+
 def cmd_add(db, args):
     if not args:
         print(color("! 用法：add <车辆ID>", "red"))
@@ -225,63 +418,195 @@ def cmd_add(db, args):
     if not car:
         return
     print(color(f"\n=== 添加报名 · {car.name} ({car.id}) ===", "bold", "cyan"))
-    print("按群友私聊信息录入，可随时 Ctrl+C 中止\n")
+    print("说明：玩家基础资料（昵称/性别/累计经验）长期复用；可到时间/是否已读本/备注按当次车录入，不影响别的车。\n")
 
     nickname = prompt("玩家昵称", required=True)
-    gender_raw = prompt("性别需求（男/女）", required=True, validator=v_gender)
+    gender_raw = prompt("性别（男/女）", required=True, validator=v_gender)
     gender = "男" if gender_raw in ("男", "M", "m") else "女"
+
+    # ------- 当次车特有信息 -------
     avail_time = prompt(
-        "可到时间（如 19:00前 / 18:30-23:00 / 全天 等）",
-        default="随时", required=True
+        "【本次】可到时间（如 19:00前 / 18:30-23:00 / 随时）",
+        default="随时", required=True,
     )
-    past_books = prompt(
-        "过往玩过的硬核本（逗号分隔，如 须臾,芥子,持斧奥夫）",
-        required=False
-    )
-    try:
-        exp_count = int(prompt(
-            "硬核本总数（根据上一项自动估算或手填）",
-            default=len([x for x in re.split(r"[,，、\s]+", past_books) if x]) or 0,
-            validator=v_int,
-        ))
-    except ValueError:
-        exp_count = 0
-    accept_cc = prompt_bool("是否接受反串", default=False)
     has_read = False
     if car.require_unread:
-        has_read = prompt_bool(f"玩家是否已读本《{car.name}》（是则不满足未读本要求）", default=False)
-    notes = prompt("备注雷点（迟到/跳车/挂机/杠精/天眼等，无则留空）", required=False)
+        has_read = prompt_bool(
+            f"【本次】玩家是否已读本《{car.name}》（是=不满足未读本要求）",
+            default=False,
+        )
+    notes = prompt("【本次】备注雷点（迟到/跳车/天眼等；无则留空）", required=False)
 
-    existing = find_player_by_nickname(db, nickname)
-    if existing:
-        print(color(f"\n? 已存在同名玩家：{existing.id} {existing.nickname}", "yellow"))
-        if prompt_bool("  沿用已有资料？（否则新建）", default=True):
-            player = existing
-        else:
-            player = Player.create(
-                nickname=nickname, gender=gender, available_time=avail_time,
-                past_hardcore_books=past_books, accept_crosscast=accept_cc,
-                notes=notes, read_this_book=has_read, experience_count=exp_count,
-            )
-            add_player(db, player)
+    # ------- 玩家长期资料 -------
+    past_books = prompt(
+        "【长期】过往硬核本履历（逗号分隔，如 须臾,芥子；可留空）",
+        required=False,
+    )
+    auto_exp = len([x for x in re.split(r"[,，、\s]+", past_books) if x])
+    exp_count_raw = prompt(
+        f"【长期】累计硬核本数（0=萌新；自动估算={auto_exp}）",
+        default=auto_exp, validator=v_int_nonneg,
+    )
+    try:
+        exp_count = int(exp_count_raw)
+    except ValueError:
+        exp_count = 0
+    accept_cc_default = prompt_bool("【长期】通常是否接受反串", default=False)
+
+    # ------- 确定玩家实体 -------
+    existing_player = find_player_by_nickname(db, nickname)
+    reuse = False
+    if existing_player:
+        print(color(f"\n? 资料库已有同名玩家：{existing_player.nickname} "
+                     f"({existing_player.gender} · {exp_display(existing_player.experience_count)})",
+                     "yellow"))
+        reuse = prompt_bool("  复用其基础资料？（当次可到时间/已读本/备注仍按本次录入）", True)
+
+    if reuse and existing_player:
+        player = existing_player
+        # 如果本次填写了更多信息，更新长期资料
+        changed = False
+        if player.gender != gender:
+            if prompt_bool(f"  性别由「{player.gender}」改为「{gender}」？", False):
+                player.gender = gender
+                changed = True
+        if past_books and player.past_hardcore_books != past_books:
+            if prompt_bool("  用本次履历更新玩家资料库？", True):
+                player.past_hardcore_books = past_books
+                changed = True
+        if exp_count > player.experience_count:
+            if prompt_bool(f"  累计经验由 {player.experience_count} 更新为 {exp_count}？", True):
+                player.experience_count = exp_count
+                changed = True
+        if accept_cc_default != player.accept_crosscast:
+            player.accept_crosscast = accept_cc_default
+            changed = True
+        if changed:
+            save_db(db)
     else:
         player = Player.create(
-            nickname=nickname, gender=gender, available_time=avail_time,
-            past_hardcore_books=past_books, accept_crosscast=accept_cc,
-            notes=notes, read_this_book=has_read, experience_count=exp_count,
+            nickname=nickname, gender=gender,
+            past_hardcore_books=past_books,
+            accept_crosscast=accept_cc_default,
+            experience_count=exp_count,
         )
         add_player(db, player)
 
-    reg = Registration.create(car.id, player.id)
+    # 问一下本次是否反串（默认跟随长期值）
+    accept_cc_this_time = None
+    if prompt_bool(f"  【本次】是否改变反串偏好？（默认：{'接受' if accept_cc_default else '不接受'}）", False):
+        accept_cc_this_time = prompt_bool("    本次是否接受反串？", accept_cc_default)
+
+    # ------- 创建/更新当次报名 -------
+    reg = Registration.create(
+        car_id=car.id, player_id=player.id,
+        available_time=avail_time, read_this_book=has_read,
+        notes=notes, accept_crosscast_override=accept_cc_this_time,
+    )
     reg = add_registration(db, reg)
-    print(color(f"\n✓ 报名登记成功！玩家ID: {player.id}", "green"))
-    print(f"  {player.nickname} | {player.gender} | {player.available_time} "
-          f"| 经验{player.experience_count} | {'接受反串' if player.accept_crosscast else '不反串'}")
+
+    cc_str = "接受反串" if reg.effective_accept_crosscast(player) else "不反串"
+    print(color(f"\n✓ 本次报名登记成功！", "green"))
+    print(f"  玩家: {player.nickname} ({player.gender} · 累计{exp_display(player.experience_count)})")
+    print(f"  本次: 可到{reg.available_time} · "
+          f"{'已读本⚠️' if reg.read_this_book else '未读本✓'} · "
+          f"{cc_str}")
+    if reg.notes:
+        print(f"  备注: {reg.notes}")
 
 
-def _gather_indexed_players(db, car, regs):
-    """返回 (index_map, ordered_list)，其中 index_map[编号] = MatchResult"""
-    triaged = triage_registrations(db, car, regs)
+# =====================================================
+#  玩家资料库
+# =====================================================
+
+def cmd_players(db, args):
+    if not db.players:
+        print(color("! 资料库暂无玩家", "yellow"))
+        return
+    print(color(f"\n{'昵称':14} {'性别':<4} {'经验':<8} {'反串':<4} {'报名次数':<8} 履历", "bold"))
+    print("-" * 78)
+    for p in sorted(db.players, key=lambda x: x.experience_count, reverse=True):
+        regs = get_player_registrations(db, p.id)
+        cc = "✓" if p.accept_crosscast else "✗"
+        books = (p.past_hardcore_books or "")[:30]
+        print(f"{p.nickname[:14]:14} {p.gender:<4} {exp_display(p.experience_count):<8} "
+              f"{cc:<4} {len(regs):<8} {books}")
+    print(f"\n共 {len(db.players)} 名玩家在库")
+
+
+# =====================================================
+#  view 命令（含筛选/排序参数与交互式菜单）
+# =====================================================
+
+def _parse_view_options(args) -> Tuple[str, str, str]:
+    """从 args 中解析筛选、排序，并返回 (car_id, filter, sort)"""
+    car_id = ""
+    filter_status = "all"
+    sort_by = "score"
+    i = 0
+    filters_map = {
+        "--pending": "pending", "--未处理": "pending",
+        "--eligible": "eligible", "--可进": "eligible", "--ok": "eligible",
+        "--approved": "approved", "--已确认": "approved",
+        "--bench": "bench", "--替补": "bench",
+        "--conflict": "conflict", "--冲突": "conflict",
+    }
+    while i < len(args):
+        a = args[i]
+        if a in filters_map:
+            filter_status = filters_map[a]
+            i += 1
+        elif a == "--sort" and i + 1 < len(args):
+            sort_by = args[i + 1].lower()
+            if sort_by not in ("score", "experience", "exp", "time", "created"):
+                print(color(f"! 未知排序方式：{sort_by}，使用 score", "yellow"))
+                sort_by = "score"
+            if sort_by == "exp":
+                sort_by = "experience"
+            i += 2
+        elif a.startswith("--sort="):
+            sort_by = a.split("=", 1)[1].lower()
+            if sort_by == "exp":
+                sort_by = "experience"
+            i += 1
+        elif not car_id and not a.startswith("--"):
+            car_id = a
+            i += 1
+        else:
+            i += 1
+    return car_id, filter_status, sort_by
+
+
+def _interactive_view_options(filter_status: str, sort_by: str) -> Tuple[str, str]:
+    """交互式选择筛选和排序"""
+    print(color("\n  当前选项：", "dim"), end="")
+    print(f"筛选={color(filter_status, 'yellow')}  排序={color(sort_by, 'yellow')}")
+    print("  筛选: 1=全部  2=仅未处理  3=仅可进正车  4=仅已确认  5=仅替补  6=仅冲突")
+    print("  排序: a=匹配分  b=经验(高→低)  c=可到时间(早→晚)  d=报名先后")
+    print("  回车=使用当前选项，q=返回")
+    try:
+        sel = input(color("  请选择> ", "cyan")).strip().lower()
+    except EOFError:
+        return filter_status, sort_by
+    if not sel or sel == "q":
+        return filter_status, sort_by
+    f_map = {"1": "all", "2": "pending", "3": "eligible", "4": "approved", "5": "bench", "6": "conflict"}
+    s_map = {"a": "score", "b": "experience", "c": "time", "d": "created"}
+    if sel in f_map:
+        filter_status = f_map[sel]
+    if sel in s_map:
+        sort_by = s_map[sel]
+    # 支持组合输入，如 "2b" = 未处理 + 按经验
+    if len(sel) >= 2:
+        if sel[0] in f_map:
+            filter_status = f_map[sel[0]]
+        if sel[1] in s_map:
+            sort_by = s_map[sel[1]]
+    return filter_status, sort_by
+
+
+def _gather_indexed_players(db, car, regs, filter_status="all", sort_by="score"):
+    triaged = triage_registrations(db, car, regs, filter_status=filter_status, sort_by=sort_by)
     sections = [
         ("conflict", "⛔ 条件冲突（严重问题，不建议入队）", triaged["conflict"]),
         ("warning", "⚠️ 时间不符 / 条件存疑（需人工确认）", triaged["warning"]),
@@ -297,61 +622,103 @@ def _gather_indexed_players(db, car, regs):
 
 
 def cmd_view(db, args):
-    if not args:
-        print(color("! 用法：view <车辆ID>", "red"))
+    car_id, filter_status, sort_by = _parse_view_options(args)
+    if not car_id:
+        print(color("! 用法：view <车辆ID> [--筛选] [--sort 方式]", "red"))
+        print(color("  筛选: --pending / --eligible / --approved / --bench / --conflict", "dim"))
+        print(color("  排序: --sort score|experience|time|created", "dim"))
         return
-    car = _get_car_or_error(db, args[0])
+    car = _get_car_or_error(db, car_id)
     if not car:
         return
     regs = get_registrations_by_car(db, car.id)
     if not regs:
-        print(color(f"! 该车尚无报名记录，使用 add {car.id} 添加", "yellow"))
+        print(color(f"! 该车尚无报名，使用 add {car.id} 添加", "yellow"))
         return
 
-    ordered, sections, triaged = _gather_indexed_players(db, car, regs)
-    total = len(ordered)
-    approved = [r for r in regs if r.status == "approved"]
-    benched = [r for r in regs if r.status == "bench"]
+    # 如果没有指定任何参数，先弹一次交互式菜单
+    if not any(a.startswith("--") for a in args):
+        filter_status, sort_by = _interactive_view_options(filter_status, sort_by)
 
-    print(color(f"\n{'='*60}", "bold", "cyan"))
-    print(color(f"🚗 {car.name}  报名分析报告  ({car.id})", "bold", "cyan"))
-    print(color(f"{'='*60}", "bold", "cyan"))
-    _print_car_header(car)
-    print(f"  报名总数: {total}  |  已确认: {len(approved)}/{car.total_players}  |  替补: {len(benched)}")
-    print()
+    while True:
+        ordered, sections, triaged = _gather_indexed_players(db, car, regs, filter_status, sort_by)
+        total = len(ordered)
+        approved_count = len([r for r in regs if r.status == "approved"])
+        benched_count = len([r for r in regs if r.status == "bench"])
 
-    idx = 0
-    for key, title, lst in sections:
-        if not lst:
-            continue
-        color_tag = "red" if key == "conflict" else ("yellow" if key == "warning" else "green")
-        print(color(f"── {title} ({len(lst)}人) ──", color_tag, "bold"))
-        for r in lst:
-            idx += 1
-            status_tag = ""
-            reg = r.registration
-            if reg.status == "approved":
-                status_tag = color(" [✔已确认]", "green")
-            elif reg.status == "bench":
-                status_tag = color(" [板凳]", "blue")
-            print(f"{color(f'[{idx:>2}]', 'bold')} {r.player.nickname} "
-                  f"({r.player.gender}·{r.player.experience_count}硬核)"
-                  f"{status_tag}")
-            extra_bits = []
-            if r.player.accept_crosscast:
-                extra_bits.append("反串OK")
-            if r.player.available_time:
-                extra_bits.append(f"可到:{r.player.available_time}")
-            if extra_bits:
-                print(f"     {color(' | '.join(extra_bits), 'dim')}")
-            if r.issues:
-                for iss in r.issues:
-                    ic = "red" if iss.severity == "critical" else "yellow"
-                    print(f"     {color('·', ic)} {color(str(iss), ic)}")
+        print(color(f"\n{'='*64}", "bold", "cyan"))
+        print(color(f"🚗 {car.name}  报名分析  ({car.id})", "bold", "cyan"))
+        print(color(f"{'='*64}", "bold", "cyan"))
+        _print_car_header(car)
+        filter_label = {
+            "all": "全部", "pending": "仅未处理", "eligible": "仅可进正车(无严重冲突)",
+            "approved": "仅已确认", "bench": "仅替补", "conflict": "仅严重冲突",
+        }
+        sort_label = {"score": "匹配分", "experience": "经验", "time": "可到时间", "created": "报名先后"}
+        print(f"  报名: {total}/{len(regs)} 人（筛选:{filter_label.get(filter_status, filter_status)}"
+              f" · 排序:{sort_label.get(sort_by, sort_by)}）"
+              f"  已确认: {approved_count}/{car.total_players}  替补: {benched_count}")
         print()
 
-    print(color(f"提示：用 approve/bench/kick {car.id} 加上方编号处理报名", "dim"))
-    print(color(f"      如：approve {car.id} 8 9 10 11   或   bench {car.id} 3", "dim"))
+        idx = 0
+        shown = 0
+        for key, title, lst in sections:
+            if not lst:
+                continue
+            color_tag = "red" if key == "conflict" else ("yellow" if key == "warning" else "green")
+            print(color(f"── {title} ({len(lst)}人) ──", color_tag, "bold"))
+            for r in lst:
+                idx += 1
+                shown += 1
+                status_tag = ""
+                reg = r.registration
+                player = r.player
+                if reg.status == "approved":
+                    status_tag = color(" [✔已确认]", "green")
+                elif reg.status == "bench":
+                    status_tag = color(" [⏸替补]", "blue")
+                cc = reg.effective_accept_crosscast(player)
+                print(f"{color(f'[{idx:>2}]', 'bold')} {player.nickname} "
+                      f"({player.gender}·{exp_display(player.experience_count)})"
+                      f"{status_tag}")
+                extra_bits = []
+                if cc:
+                    extra_bits.append("反串OK")
+                extra_bits.append(f"可到:{reg.available_time}")
+                if reg.read_this_book:
+                    extra_bits.append(color("已读本⚠️", "red"))
+                if extra_bits:
+                    print(f"     {color(' | '.join(extra_bits), 'dim')}")
+                if reg.notes:
+                    print(f"     {color('📝 ' + reg.notes, 'dim')}")
+                if r.issues:
+                    for iss in r.issues:
+                        ic = "red" if iss.severity == "critical" else "yellow"
+                        print(f"     {color('·', ic)} {color(str(iss), ic)}")
+            print()
+
+        if shown == 0:
+            print(color("  （当前筛选下无记录，试试切换筛选条件）", "dim"))
+
+        print(color("快捷操作：数字键切换筛选/排序 · r=刷新 · q=退出当前view", "dim"))
+        print(color(f"          approve/bench/kick {car.id} <序号...>  可在主界面执行", "dim"))
+        try:
+            sel = input(color("\n按回车刷新，或输入选项> ", "cyan")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not sel:
+            continue
+        if sel in ("q", "quit", "exit"):
+            break
+        if sel == "r":
+            continue
+        # 切换筛选/排序
+        prev_f, prev_s = filter_status, sort_by
+        filter_status, sort_by = _interactive_view_options(filter_status, sort_by)
+        if (prev_f, prev_s) == (filter_status, sort_by) and sel not in ("1", "2", "3", "4", "5", "6", "a", "b", "c", "d"):
+            # 如果不是选项命令，也没有变化，退出交互
+            break
 
 
 def _print_car_header(car):
@@ -361,12 +728,13 @@ def _print_car_header(car):
     st_color = {"open": "green", "full": "yellow", "done": "blue", "cancel": "red"}
     st = status_map.get(car.status, car.status)
     stc = st_color.get(car.status, "white")
+    exp_str = f"≥{car.min_experience}硬核本" if car.min_experience > 0 else "无门槛"
     print(f"  🕒 {time_str} (周{weekday}) · 约{car.duration_hours}小时")
     print(f"  📍 {car.city} · {car.shop}")
     print(f"  👥 {car.total_players}人  "
           f"| 状态: {color(st, stc, 'bold')}  "
           f"| 未读本: {'✓' if car.require_unread else '✗'}  "
-          f"| 门槛: ≥{car.min_experience}硬核本")
+          f"| 门槛: {exp_str}")
     if car.role_constraints:
         print(f"  🎭 角色配置: {car.role_constraints}")
 
@@ -409,24 +777,27 @@ def cmd_approve(db, args, bench=False, kick=False):
             db.registrations = [r for r in db.registrations if r.id != reg.id]
             print(color(f"✗ 已移除: {mr.player.nickname}", "red"))
         elif bench:
+            if reg.status == "approved":
+                approved_count -= 1
             reg.status = "bench"
-            if reg in db.registrations:
-                pass
             print(color(f"⏸ 设为替补: {mr.player.nickname}", "blue"))
         else:
             if approved_count >= car.total_players and reg.status != "approved":
                 print(color(f"! 已达满员{car.total_players}人，{mr.player.nickname}自动设为替补", "yellow"))
                 reg.status = "bench"
             else:
-                reg.status = "approved"
-                if reg.status == "approved":
+                if reg.status != "approved":
                     approved_count += 1
+                reg.status = "approved"
                 print(color(f"✓ 确认入队: {mr.player.nickname}", "green"))
     save_db(db)
 
     if approved_count >= car.total_players and car.status == "open" and not kick:
         if prompt_bool(f"  已确认{approved_count}人达到上限，是否将车辆标记为「已满」？", True):
             update_car_status(db, car.id, "full")
+    elif approved_count < car.total_players and car.status == "full" and not kick and not bench:
+        if prompt_bool(f"  已确认{approved_count}人少于上限，是否恢复为「招集中」？", False):
+            update_car_status(db, car.id, "open")
 
 
 def cmd_list(db, _):
@@ -434,8 +805,8 @@ def cmd_list(db, _):
     if not cars:
         print(color("! 暂无车辆，使用 new 命令开新车", "yellow"))
         return
-    print(color(f"\n{'ID':10} {'本名':12} {'人数':>4} {'时间':18} {'地点':10} {'状态':6} {'报名':>5}", "bold"))
-    print("-" * 70)
+    print(color(f"\n{'ID':10} {'本名':14} {'人数':>5} {'时间':18} {'地点':14} {'状态':8} 报名", "bold"))
+    print("-" * 78)
     for c in cars:
         regs = get_registrations_by_car(db, c.id)
         approved = len([r for r in regs if r.status == "approved"])
@@ -443,8 +814,10 @@ def cmd_list(db, _):
                       "done": color("已结束", "blue"), "cancel": color("取消", "red")}
         st = status_map.get(c.status, c.status)
         time_str = c.start_time.strftime("%m-%d %H:%M")
-        print(f"{c.id:10} {c.name[:12]:12} {approved}/{c.total_players:>3} "
-              f"{time_str:18} {(c.city+'.'+c.shop)[:10]:10} {st:10} {len(regs):>3}")
+        loc = f"{c.city}·{c.shop}"
+        exp_tag = f"≥{c.min_experience}" if c.min_experience > 0 else "0门槛"
+        print(f"{c.id:10} {c.name[:14]:14} {approved}/{c.total_players:>4} "
+              f"{time_str:18} {loc[:14]:14} {st:10} {len(regs):>3}  {exp_tag}")
     print()
 
 
@@ -475,6 +848,10 @@ def cmd_info(db, args):
     print(f"  本名: {car.name}")
     _print_car_header(car)
     print(f"  创建时间: {car.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    if car.template_id:
+        tpl = get_template(db, car.template_id)
+        if tpl:
+            print(f"  来源模板: {tpl.name}")
     regs = get_registrations_by_car(db, car.id)
     if regs:
         print(f"\n  报名列表 ({len(regs)}):")
@@ -482,10 +859,17 @@ def cmd_info(db, args):
             p = get_player(db, reg.player_id)
             if not p:
                 continue
-            status_map = {"pending": "待审核", "approved": color("✔已确认", "green"),
-                          "bench": color("⏸替补", "blue"), "rejected": color("✗拒绝", "red")}
+            status_map = {"pending": color("待审核", "yellow"),
+                          "approved": color("✔已确认", "green"),
+                          "bench": color("⏸替补", "blue"),
+                          "rejected": color("✗拒绝", "red")}
             st = status_map.get(reg.status, reg.status)
-            print(f"    {i:>2}. {p.nickname} ({p.gender}·经验{p.experience_count}) · {st}")
+            cc = reg.effective_accept_crosscast(p)
+            print(f"    {i:>2}. {p.nickname} ({p.gender}·{exp_display(p.experience_count)}) "
+                  f"· 可到:{reg.available_time} · {'已读本⚠️' if reg.read_this_book else ''} "
+                  f"· {'反串OK' if cc else ''} · {st}")
+            if reg.notes:
+                print(f"        📝 {reg.notes}")
     else:
         print(color("  暂无报名", "dim"))
     print()
@@ -512,27 +896,19 @@ def cmd_export(db, args):
     if not car:
         return
     regs = get_registrations_by_car(db, car.id)
-    approved = [r for r in regs if r.status == "approved"]
-    benched = [r for r in regs if r.status == "bench"]
-    pending = [r for r in regs if r.status == "pending"]
+    approved_regs = [r for r in regs if r.status == "approved"]
+    benched_regs = [r for r in regs if r.status == "bench"]
+    pending_regs = [r for r in regs if r.status == "pending"]
 
     weekday = ["一", "二", "三", "四", "五", "六", "日"][car.start_time.weekday()]
     time_str = car.start_time.strftime(f"%Y年%m月%d日 周{weekday} %H:%M")
-
     end_time = car.start_time + timedelta(hours=car.duration_hours)
     end_str = end_time.strftime("%H:%M")
 
-    players_approved = []
-    for r in approved:
-        p = get_player(db, r.player_id)
-        if p:
-            players_approved.append(p)
-
-    players_benched = []
-    for r in benched:
-        p = get_player(db, r.player_id)
-        if p:
-            players_benched.append(p)
+    approved_pairs = [(r, get_player(db, r.player_id)) for r in approved_regs]
+    approved_pairs = [(r, p) for r, p in approved_pairs if p]
+    benched_pairs = [(r, get_player(db, r.player_id)) for r in benched_regs]
+    benched_pairs = [(r, p) for r, p in benched_pairs if p]
 
     # --- 群公告 ---
     print(color("\n" + "═" * 62, "bold", "cyan"))
@@ -549,15 +925,18 @@ def cmd_export(db, args):
         announcement.append(f"🎲 配置：{car.role_constraints}")
     if car.require_unread:
         announcement.append(f"📜 要求：全员未读本，严禁天眼 / 剧透")
-    if car.min_experience:
+    if car.min_experience > 0:
         announcement.append(f"💪 门槛：需≥{car.min_experience}个硬核本经验")
+    else:
+        announcement.append(f"💪 门槛：无（萌新友好）")
     announcement.append("")
 
-    if players_approved:
+    if approved_pairs:
         announcement.append("✅ 已确认名单（按到场先后排序）：")
-        for i, p in enumerate(players_approved, 1):
+        for i, (r, p) in enumerate(approved_pairs, 1):
             tag = ""
-            if p.accept_crosscast and (
+            cc = r.effective_accept_crosscast(p)
+            if cc and (
                 (car.role_constraints and "男" in car.role_constraints and p.gender == "女") or
                 (car.role_constraints and "女" in car.role_constraints and p.gender == "男")
             ):
@@ -567,15 +946,15 @@ def cmd_export(db, args):
     else:
         announcement.append(color("⚠️ 尚未确认任何玩家入队！请先用 approve 确认。", "yellow"))
 
-    if players_benched:
+    if benched_pairs:
         announcement.append("")
         announcement.append("⏳ 替补名单：")
-        for i, p in enumerate(players_benched, 1):
-            announcement.append(f"  {i}. {p.nickname} ({p.gender})")
+        for i, (r, p) in enumerate(benched_pairs, 1):
+            announcement.append(f"  {i}. {p.nickname} ({p.gender}·{exp_display(p.experience_count)})  可到:{r.available_time}")
 
-    if pending:
+    if pending_regs:
         announcement.append("")
-        announcement.append(f"🔍 待审核：{len(pending)}人（车头私聊中）")
+        announcement.append(f"🔍 待审核：{len(pending_regs)}人（车头私聊中）")
 
     announcement.append("")
     announcement.append("━" * 42)
@@ -595,26 +974,28 @@ def cmd_export(db, args):
     for line in announcement:
         print(line)
 
-    # --- 确认名单（表格，方便车头自己记录） ---
+    # --- 车头清单 ---
     print(color("\n" + "─" * 62, "dim"))
     print(color("  📋 车头确认清单（内部用）", "bold", "yellow"))
     print(color("─" * 62, "dim"))
 
-    print(color(f"\n{'序号':<4}{'昵称':<14}{'性别':<4}{'经验':<6}{'反串':<4}{'定金':<4}{'备注'}", "bold"))
-    print("-" * 60)
-    for i, p in enumerate(players_approved, 1):
-        exp_str = f"{p.experience_count}硬核"
-        cc_str = "✓" if p.accept_crosscast else "✗"
-        note = p.notes[:12] if p.notes else ""
-        print(f"{i:<4}{p.nickname[:12]:<14}{p.gender:<4}{exp_str:<8}{cc_str:<4}{'□':<4}{note}")
-    if players_benched:
+    print(color(f"\n{'序号':<4}{'昵称':<14}{'性别':<4}{'经验':<8}{'反串':<4}{'可到时间':<14}{'定金':<4}{'备注'}", "bold"))
+    print("-" * 78)
+    for i, (r, p) in enumerate(approved_pairs, 1):
+        exp_str = exp_display(p.experience_count)
+        cc_str = "✓" if r.effective_accept_crosscast(p) else "✗"
+        note = r.notes[:16] if r.notes else ""
+        if r.read_this_book:
+            note = ("⚠️已读本 " + note)[:16]
+        print(f"{i:<4}{p.nickname[:12]:<14}{p.gender:<4}{exp_str:<8}{cc_str:<4}"
+              f"{r.available_time[:12]:<14}{'□':<4}{note}")
+    if benched_pairs:
         print(color(f"\n── 替补席 ──", "blue", "bold"))
-        for i, p in enumerate(players_benched, 1):
-            exp_str = f"{p.experience_count}硬核"
-            print(f"  B{i}. {p.nickname} ({p.gender}·{exp_str}) 可到:{p.available_time}")
+        for i, (r, p) in enumerate(benched_pairs, 1):
+            print(f"  B{i}. {p.nickname} ({p.gender}·{exp_display(p.experience_count)})  "
+                  f"可到:{r.available_time}  {r.notes or ''}")
 
     print()
-    # 导出到剪贴板（如果可用）
     try:
         full_text = "\n".join(announcement)
         if os.name == "nt":
@@ -648,6 +1029,8 @@ COMMANDS = {
     "remove": lambda db, args: cmd_approve(db, args, kick=True),
     "info": cmd_info, "detail": cmd_info,
     "del": cmd_del, "delete": cmd_del, "rm": cmd_del,
+    "players": cmd_players,
+    "template": cmd_template, "tpl": cmd_template, "t": cmd_template,
     "help": cmd_help, "?": cmd_help, "h": cmd_help,
 }
 
