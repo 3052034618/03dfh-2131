@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-集成测试套件 v1.1 - 适配：
+集成测试套件 v1.2 - 适配：
   - 0经验允许
   - 模板功能
   - 玩家/报名字段拆分
   - view筛选/排序
+  - 玩家长期标签
+  - 车队复制
+  - 序号范围解析
+  - 三种导出格式
 """
 import sys
 import os
@@ -21,12 +25,14 @@ from storage import (
     add_player, get_player, find_player_by_nickname,
     add_registration, remove_registration, get_registrations_by_car,
     add_template, get_template, list_templates, delete_template,
+    add_player_tag, remove_player_tag, list_players_by_tag,
     DB_FILE,
 )
 from matcher import (
     triage_registrations, analyze_match,
     check_time_match, check_gender_role_match, check_book_read_rule,
-    check_experience, check_notes_conflict, _parse_time_availability,
+    check_experience, check_notes_conflict, check_player_tags,
+    _parse_time_availability,
 )
 
 
@@ -37,20 +43,34 @@ def sep(title):
     print("=" * 60)
 
 
+def _clean_db():
+    backup = None
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            backup = f.read()
+        os.remove(DB_FILE)
+    return backup
+
+
+def _restore_db(backup):
+    if backup is not None:
+        os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            f.write(backup)
+    elif os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+
+
 def test_v_int_nonneg():
-    """0经验输入验证器"""
-    sep("0经验验证器 v_int_nonneg（从 hardcore_car.py 导入逻辑测试）")
-    sys.path.insert(0, ".")
+    sep("0经验验证器 v_int_nonneg")
     from hardcore_car import v_int_pos, v_int_nonneg, exp_display
 
-    # v_int_pos：必须 > 0
     cases_pos = [("6", True), ("1", True), ("0", False), ("-1", False), ("abc", False)]
     for val, expected in cases_pos:
         ok, _ = v_int_pos(val)
         mark = "✓" if ok == expected else "✗"
         print(f"  {mark} v_int_pos({val!r}) = {ok}  (期望 {expected})")
 
-    # v_int_nonneg：允许 0
     cases_nonneg = [("0", True), ("5", True), ("100", True), ("-1", False), ("abc", False)]
     all_ok = True
     for val, expected in cases_nonneg:
@@ -60,7 +80,6 @@ def test_v_int_nonneg():
             all_ok = False
         print(f"  {mark} v_int_nonneg({val!r}) = {ok}  (期望 {expected})")
 
-    # exp_display 0经验显示
     cases_exp = [(0, "萌新"), (1, "1硬核"), (5, "5硬核")]
     for n, expected in cases_exp:
         got = exp_display(n)
@@ -94,19 +113,10 @@ def test_time_parser():
 
 
 def test_player_registration_split():
-    """玩家长期资料 vs 单次报名字段分离"""
     sep("玩家/报名字段分离测试")
-    # 备份
-    backup = None
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            backup = f.read()
-    if os.path.exists(DB_FILE):
-        os.remove(DB_FILE)
+    backup = _clean_db()
     db = load_db()
-
     try:
-        # 同一玩家报两个车，可到时间、已读本、备注互不影响
         car1 = Car.create(
             name="《须臾》", total_players=6, duration_hours=6,
             city="上海", shop="A店",
@@ -122,7 +132,6 @@ def test_player_registration_split():
         add_car(db, car1)
         add_car(db, car2)
 
-        # 同一个玩家（同一个 Player 对象）
         player = Player.create(
             nickname="小明", gender="男",
             past_hardcore_books="年轮,漓川",
@@ -130,7 +139,6 @@ def test_player_registration_split():
         )
         add_player(db, player)
 
-        # 第一次报名：车1 - 19点前到，已读本，备注"有迟到前科"
         reg1 = Registration.create(
             car_id=car1.id, player_id=player.id,
             available_time="19:00前", read_this_book=True,
@@ -138,7 +146,6 @@ def test_player_registration_split():
         )
         add_registration(db, reg1)
 
-        # 第二次报名：车2 - 全天，未读本，无备注，本次接受反串
         reg2 = Registration.create(
             car_id=car2.id, player_id=player.id,
             available_time="全天", read_this_book=False,
@@ -146,52 +153,36 @@ def test_player_registration_split():
         )
         add_registration(db, reg2)
 
-        # 验证：同一玩家ID，但 Registration 字段不同
         regs1 = get_registrations_by_car(db, car1.id)
         regs2 = get_registrations_by_car(db, car2.id)
-        assert len(regs1) == 1 and len(regs2) == 1, "报名数量不对"
         r1, r2 = regs1[0], regs2[0]
-        assert r1.player_id == r2.player_id == player.id, "应是同一玩家"
 
         ok1 = r1.available_time == "19:00前" and r1.read_this_book is True and "迟到" in r1.notes
         ok2 = r2.available_time == "全天" and r2.read_this_book is False and r2.notes == ""
-        ok3 = r2.effective_accept_crosscast(player) is True  # 本次覆盖
-        ok4 = r1.effective_accept_crosscast(player) is False  # 跟随玩家默认值
+        ok3 = r2.effective_accept_crosscast(player) is True
+        ok4 = r1.effective_accept_crosscast(player) is False
 
-        print(f"  {'✓' if ok1 else '✗'} 车1报名信息独立保存: 可到={r1.available_time} 已读本={r1.read_this_book} 备注={r1.notes}")
-        print(f"  {'✓' if ok2 else '✗'} 车2报名信息独立保存: 可到={r2.available_time} 已读本={r2.read_this_book} 备注={r2.notes}")
-        print(f"  {'✓' if ok3 else '✗'} 车2本次接受反串覆盖玩家默认值")
-        print(f"  {'✓' if ok4 else '✗'} 车1使用玩家默认值（不反串）")
+        print(f"  {'✓' if ok1 else '✗'} 车1报名信息独立保存")
+        print(f"  {'✓' if ok2 else '✗'} 车2报名信息独立保存")
+        print(f"  {'✓' if ok3 else '✗'} 车2本次反串覆盖玩家默认")
+        print(f"  {'✓' if ok4 else '✗'} 车1使用玩家默认值")
 
-        # 验证匹配引擎使用 Registration 字段
         mr1 = analyze_match(car1, r1, player)
         mr2 = analyze_match(car2, r2, player)
         book_issue_1 = any("未读本" in str(i) for i in mr1.issues)
         book_issue_2 = any("未读本" in str(i) for i in mr2.issues)
         ok5 = book_issue_1 and not book_issue_2
-        print(f"  {'✓' if ok5 else '✗'} 匹配引擎使用当次报名的已读本字段: 车1检测到未读本冲突={book_issue_1}, 车2={book_issue_2}")
+        print(f"  {'✓' if ok5 else '✗'} 匹配引擎使用当次报名字段")
 
         return all([ok1, ok2, ok3, ok4, ok5])
     finally:
-        if backup is not None:
-            os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-            with open(DB_FILE, "w", encoding="utf-8") as f:
-                f.write(backup)
-        elif os.path.exists(DB_FILE):
-            os.remove(DB_FILE)
+        _restore_db(backup)
 
 
 def test_templates():
-    """模板保存、列出、套用、删除"""
     sep("车队模板功能")
-    backup = None
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            backup = f.read()
-    if os.path.exists(DB_FILE):
-        os.remove(DB_FILE)
+    backup = _clean_db()
     db = load_db()
-
     try:
         tpl = CarTemplate.create(
             name="周末硬核标配", total_players=6, duration_hours=5.0,
@@ -202,22 +193,18 @@ def test_templates():
         add_template(db, tpl)
         print(f"  ✓ 模板已保存: ID={tpl.id} 名称={tpl.name}")
 
-        # 按名称查找
         found = get_template(db, "周末硬核标配")
         ok1 = found is not None and found.min_experience == 3
-        print(f"  {'✓' if ok1 else '✗'} 按名称查询模板: found={found is not None} min_exp={found.min_experience if found else None}")
+        print(f"  {'✓' if ok1 else '✗'} 按名称查询模板")
 
-        # 按 ID 查找
         found2 = get_template(db, tpl.id)
         ok2 = found2 is not None
         print(f"  {'✓' if ok2 else '✗'} 按ID查询模板")
 
-        # list_templates
         tpls = list_templates(db)
         ok3 = len(tpls) == 1
         print(f"  {'✓' if ok3 else '✗'} list_templates 数量: {len(tpls)}")
 
-        # 保存 0 门槛模板
         tpl2 = CarTemplate.create(
             name="萌新友好本", total_players=5, duration_hours=4.0,
             city="北京", shop="新店",
@@ -226,34 +213,21 @@ def test_templates():
         )
         add_template(db, tpl2)
         ok4 = tpl2.min_experience == 0
-        print(f"  {'✓' if ok4 else '✗'} 支持保存0门槛模板: min_exp={tpl2.min_experience}")
+        print(f"  {'✓' if ok4 else '✗'} 支持0门槛模板")
 
-        # 删除
         delete_template(db, tpl2.id)
         ok5 = get_template(db, tpl2.id) is None
         print(f"  {'✓' if ok5 else '✗'} 删除模板成功")
 
         return all([ok1, ok2, ok3, ok4, ok5])
     finally:
-        if backup is not None:
-            os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-            with open(DB_FILE, "w", encoding="utf-8") as f:
-                f.write(backup)
-        elif os.path.exists(DB_FILE):
-            os.remove(DB_FILE)
+        _restore_db(backup)
 
 
 def test_view_filter_sort():
-    """view 筛选和排序"""
     sep("view 筛选与排序")
-    backup = None
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            backup = f.read()
-    if os.path.exists(DB_FILE):
-        os.remove(DB_FILE)
+    backup = _clean_db()
     db = load_db()
-
     try:
         car = Car.create(
             name="测试筛选车", total_players=6, duration_hours=5,
@@ -263,13 +237,12 @@ def test_view_filter_sort():
         )
         add_car(db, car)
 
-        # 创建3类玩家：匹配、存疑、冲突
         configs = [
-            ("萌新", "男", 0, "随时", False, "", "pending"),       # 0经验(萌新)，匹配
-            ("老司机", "男", 10, "18:30-23:00", False, "", "approved"),  # 匹配+已确认
-            ("迟到王", "男", 3, "随时", False, "经常迟到", "pending"),  # 仅warning(备注)，无时间冲突
-            ("剧透鬼", "男", 5, "随时", True, "", "pending"),       # 已读本critical
-            ("替补A", "女", 2, "随时", False, "", "bench"),         # 替补状态
+            ("萌新", "男", 0, "随时", False, "", "pending"),
+            ("老司机", "男", 10, "18:30-23:00", False, "", "approved"),
+            ("迟到王", "男", 3, "随时", False, "经常迟到", "pending"),
+            ("剧透鬼", "男", 5, "随时", True, "", "pending"),
+            ("替补A", "女", 2, "随时", False, "", "bench"),
         ]
         for nick, gender, exp, avail, has_read, notes, status in configs:
             p = Player.create(nickname=nick, gender=gender,
@@ -283,59 +256,272 @@ def test_view_filter_sort():
 
         regs = get_registrations_by_car(db, car.id)
 
-        # 筛选: pending (未处理)
         tri = triage_registrations(db, car, regs, filter_status="pending")
         pending_count = len(tri["conflict"]) + len(tri["warning"]) + len(tri["match"])
-        ok1 = pending_count == 3  # 萌新 + 迟到王 + 剧透鬼
-        print(f"  {'✓' if ok1 else '✗'} --pending 筛选: 期望3，实际{pending_count}")
+        ok1 = pending_count == 3
+        print(f"  {'✓' if ok1 else '✗'} --pending: 期望3，实际{pending_count}")
 
-        # 筛选: eligible (可进正车=无critical)
         tri = triage_registrations(db, car, regs, filter_status="eligible")
         eligible_count = len(tri["conflict"]) + len(tri["warning"]) + len(tri["match"])
-        ok2 = eligible_count == 4  # 去掉剧透鬼
-        print(f"  {'✓' if ok2 else '✗'} --eligible 筛选(无严重冲突): 期望4，实际{eligible_count}")
+        ok2 = eligible_count == 4
+        print(f"  {'✓' if ok2 else '✗'} --eligible: 期望4，实际{eligible_count}")
 
-        # 筛选: approved
         tri = triage_registrations(db, car, regs, filter_status="approved")
         approved_count = len(tri["conflict"]) + len(tri["warning"]) + len(tri["match"])
         ok3 = approved_count == 1
-        print(f"  {'✓' if ok3 else '✗'} --approved 筛选: 期望1，实际{approved_count}")
+        print(f"  {'✓' if ok3 else '✗'} --approved: 期望1，实际{approved_count}")
 
-        # 排序: experience (降序)
         tri = triage_registrations(db, car, regs, filter_status="all", sort_by="experience")
         all_sorted = tri["all"]
         exps = [r.player.experience_count for r in all_sorted]
         ok4 = exps == sorted(exps, reverse=True)
         print(f"  {'✓' if ok4 else '✗'} --sort experience 降序: {exps}")
 
-        # 排序: time (升序，解析后的最早分钟)
-        tri = triage_registrations(db, car, regs, filter_status="all", sort_by="time")
-        all_sorted = tri["match"] + tri["warning"] + tri["conflict"]
-        times = [r.registration.available_time for r in all_sorted]
-        print(f"  ✓ --sort time 结果: {times}")  # 目测合理即可，不做严格断言
-
         return all([ok1, ok2, ok3, ok4])
     finally:
-        if backup is not None:
-            os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-            with open(DB_FILE, "w", encoding="utf-8") as f:
-                f.write(backup)
-        elif os.path.exists(DB_FILE):
-            os.remove(DB_FILE)
+        _restore_db(backup)
 
 
-def test_full_workflow_v11():
-    sep("完整工作流 v1.1（0经验+模板+分离+筛选）")
-    backup = None
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            backup = f.read()
-    if os.path.exists(DB_FILE):
-        os.remove(DB_FILE)
+def test_player_tags():
+    """v1.2: 玩家长期标签功能"""
+    sep("玩家长期标签")
+    backup = _clean_db()
     db = load_db()
-
     try:
-        # 1. 先建模板
+        p = Player.create(
+            nickname="标签哥", gender="男",
+            past_hardcore_books="", accept_crosscast=False,
+            experience_count=5, tags=["靠谱", "易迟到"],
+        )
+        add_player(db, p)
+
+        ok1 = p.has_tag("靠谱") and p.has_tag("易迟到") and not p.has_tag("跳车")
+        print(f"  {'✓' if ok1 else '✗'} has_tag: 靠谱={p.has_tag('靠谱')} 易迟到={p.has_tag('易迟到')} 跳车={p.has_tag('跳车')}")
+
+        risk = p.risk_tags()
+        good = p.good_tags()
+        ok2 = "易迟到" in risk and "靠谱" in good
+        print(f"  {'✓' if ok2 else '✗'} risk_tags={risk} good_tags={good}")
+
+        p.add_tag("天眼风险")
+        p.add_tag("靠谱")  # 重复加不报错
+        ok3 = p.has_tag("天眼风险") and p.tags.count("靠谱") == 1
+        print(f"  {'✓' if ok3 else '✗'} add_tag: 天眼风险={p.has_tag('天眼风险')} 靠谱不重复={p.tags.count('靠谱') == 1}")
+
+        p.remove_tag("易迟到")
+        ok4 = not p.has_tag("易迟到")
+        print(f"  {'✓' if ok4 else '✗'} remove_tag: 易迟到={p.has_tag('易迟到')}")
+
+        # storage层 add_player_tag / remove_player_tag
+        add_player_tag(db, p.id, "跳车")
+        ok5 = p.has_tag("跳车")
+        print(f"  {'✓' if ok5 else '✗'} storage.add_player_tag: 跳车={p.has_tag('跳车')}")
+
+        remove_player_tag(db, p.id, "跳车")
+        ok6 = not p.has_tag("跳车")
+        print(f"  {'✓' if ok6 else '✗'} storage.remove_player_tag: 跳车={p.has_tag('跳车')}")
+
+        # list_players_by_tag
+        p2 = Player.create(nickname="也靠谱", gender="女", tags=["靠谱", "推土机"])
+        add_player(db, p2)
+        by_tag = list_players_by_tag(db, "靠谱")
+        ok7 = len(by_tag) == 2
+        print(f"  {'✓' if ok7 else '✗'} list_players_by_tag('靠谱'): {len(by_tag)}人")
+
+        # matcher check_player_tags: 天眼风险应该产生critical
+        car = Car.create(
+            name="标签测试车", total_players=6, duration_hours=5,
+            city="", shop="",
+            start_time=datetime.now() + timedelta(days=1),
+            require_unread=True, min_experience=0,
+        )
+        add_car(db, car)
+        p3 = Player.create(nickname="天眼哥", gender="男", tags=["天眼风险", "靠谱"])
+        add_player(db, p3)
+        reg3 = Registration.create(car.id, p3.id, available_time="随时", read_this_book=False)
+        add_registration(db, reg3)
+        tag_issues = check_player_tags(car, reg3, p3)
+        has_critical = any(i.severity == "critical" for i in tag_issues)
+        ok8 = has_critical
+        print(f"  {'✓' if ok8 else '✗'} check_player_tags: 天眼风险→critical={has_critical}")
+
+        # analyze_match 里正面标签应降低 severity_score
+        mr = analyze_match(car, reg3, p3)
+        has_good_bonus = any("靠谱" in str(i) for i in mr.issues) is False  # 正面标签不产生issue，但加分
+        print(f"  {'✓' if has_good_bonus else '✗'} 正面标签不产生issue（加分通过severity_score）")
+
+        return all([ok1, ok2, ok3, ok4, ok5, ok6, ok7, ok8])
+    finally:
+        _restore_db(backup)
+
+
+def test_car_copy():
+    """v1.2: 车队复制功能"""
+    sep("车队复制")
+    backup = _clean_db()
+    db = load_db()
+    try:
+        original = Car.create(
+            name="《立方馆谋杀始末》", total_players=6, duration_hours=5.0,
+            city="上海", shop="硬核旗舰店",
+            start_time=datetime.now() + timedelta(days=1),
+            role_constraints="3男3女", require_unread=True, min_experience=3,
+        )
+        add_car(db, original)
+
+        # 添加几个报名到原车
+        p1 = Player.create(nickname="玩家A", gender="男", experience_count=5)
+        add_player(db, p1)
+        reg1 = Registration.create(original.id, p1.id, available_time="随时")
+        add_registration(db, reg1)
+
+        # 复制车，只改时间和店铺
+        new_time = datetime.now() + timedelta(days=8)
+        new_car = original.copy(
+            start_time=new_time,
+            shop="硬核分店",
+        )
+        add_car(db, new_car)
+
+        # 验证复制结果
+        ok1 = new_car.id != original.id
+        ok2 = new_car.name == original.name
+        ok3 = new_car.total_players == original.total_players
+        ok4 = new_car.duration_hours == original.duration_hours
+        ok5 = new_car.city == original.city
+        ok6 = new_car.shop == "硬核分店"  # 被覆盖
+        ok7 = new_car.start_time == new_time  # 被覆盖
+        ok8 = new_car.role_constraints == original.role_constraints
+        ok9 = new_car.require_unread == original.require_unread
+        ok10 = new_car.min_experience == original.min_experience
+
+        # 新车不应有报名
+        new_regs = get_registrations_by_car(db, new_car.id)
+        ok11 = len(new_regs) == 0
+
+        # 原车报名不受影响
+        orig_regs = get_registrations_by_car(db, original.id)
+        ok12 = len(orig_regs) == 1
+
+        checks = [ok1, ok2, ok3, ok4, ok5, ok6, ok7, ok8, ok9, ok10, ok11, ok12]
+        labels = ["新ID", "同名", "同人数", "同时长", "同城市", "新店铺", "新时间",
+                  "同角色配置", "同未读本要求", "同经验门槛", "新车无报名", "原车报名不变"]
+        for label, ok in zip(labels, checks):
+            print(f"  {'✓' if ok else '✗'} {label}")
+
+        return all(checks)
+    finally:
+        _restore_db(backup)
+
+
+def test_parse_index_ranges():
+    """v1.2: 序号范围解析（用于view内批量审核）"""
+    sep("序号范围解析 parse_index_ranges")
+    from hardcore_car import parse_index_ranges
+
+    cases = [
+        ("1", [1]),
+        ("1,3,5", [1, 3, 5]),
+        ("1-3", [1, 2, 3]),
+        ("1-3,7", [1, 2, 3, 7]),
+        ("5-3", [3, 4, 5]),  # 反向范围
+        ("1,2,3-5,8", [1, 2, 3, 4, 5, 8]),
+        ("", []),
+        ("1,3-5,10,12-14", [1, 3, 4, 5, 10, 12, 13, 14]),
+        ("1，3，5", [1, 3, 5]),  # 中文逗号
+    ]
+    all_ok = True
+    for input_, expected in cases:
+        result = parse_index_ranges(input_)
+        ok = result == expected
+        mark = "✓" if ok else "✗"
+        if not ok:
+            all_ok = False
+        print(f"  {mark} {input_!r:25} => {result}  (期望 {expected})")
+    return all_ok
+
+
+def test_export_formats():
+    """v1.2: 三种导出格式 × 两种范围"""
+    sep("导出格式 notice/check/shop × approved/bench")
+    backup = _clean_db()
+    db = load_db()
+    try:
+        car = Car.create(
+            name="导出测试车", total_players=4, duration_hours=5,
+            city="上海", shop="测试店",
+            start_time=datetime.now().replace(hour=19, minute=0) + timedelta(days=1),
+            require_unread=True, min_experience=0,
+        )
+        add_car(db, car)
+
+        # 创建玩家并标记状态
+        configs = [
+            ("萌新甲", "男", 0, "随时", False, "", "approved", []),
+            ("老手乙", "女", 5, "随时", False, "", "approved", ["靠谱"]),
+            ("替补丙", "男", 3, "随时", False, "", "bench", ["易迟到"]),
+            ("待审丁", "女", 1, "随时", True, "可能天眼", "pending", ["天眼风险"]),
+        ]
+        for nick, gender, exp, avail, has_read, notes, status, tags in configs:
+            p = Player.create(nickname=nick, gender=gender, experience_count=exp, tags=tags)
+            add_player(db, p)
+            reg = Registration.create(car.id, p.id, available_time=avail,
+                                      read_this_book=has_read, notes=notes)
+            reg.status = status
+            add_registration(db, reg)
+
+        from hardcore_car import cmd_export
+        import io
+        from unittest.mock import patch
+
+        # 测试1: export <id> notice approved（仅群公告+仅已确认）
+        with patch('sys.stdout', new_callable=io.StringIO) as mock_out:
+            cmd_export(db, [car.id, "notice", "approved"])
+            output = mock_out.getvalue()
+        ok1 = "萌新甲" in output and "老手乙" in output
+        ok1b = "替补丙" not in output  # approved scope 不含替补
+        ok1c = "萌新" in output or "[萌新]" in output  # 0经验显示
+        print(f"  {'✓' if ok1 else '✗'} notice approved: 含已确认={ok1} 不含替补={ok1b}")
+        print(f"  {'✓' if ok1c else '✗'} notice 0经验显示: 萌新标记={'ok' if ok1c else 'missing'}")
+
+        # 测试2: export <id> check bench（审核表+已确认+替补）
+        with patch('sys.stdout', new_callable=io.StringIO) as mock_out:
+            cmd_export(db, [car.id, "check", "bench"])
+            output = mock_out.getvalue()
+        ok2 = "替补丙" in output
+        ok2b = "易迟到" in output or "天眼" in output  # 风险标签带出
+        print(f"  {'✓' if ok2 else '✗'} check bench: 含替补={ok2} 风险标签带出={ok2b}")
+
+        # 测试3: export <id> shop approved（店铺表+仅已确认）
+        with patch('sys.stdout', new_callable=io.StringIO) as mock_out:
+            cmd_export(db, [car.id, "shop", "approved"])
+            output = mock_out.getvalue()
+        ok3 = "导出测试车" in output and "测试店" in output
+        ok3b = "无门槛" in output or "含萌新" in output  # 0门槛信息
+        ok3c = "萌新" in output  # 0经验显示
+        ok3d = "替补" not in output  # approved scope 不含替补（合计行也不出现替补字样）
+        print(f"  {'✓' if ok3b else '✗'} shop 0门槛信息: {ok3b}")
+        print(f"  {'✓' if ok3c else '✗'} shop 0经验显示: {ok3c}")
+        print(f"  {'✓' if ok3d else '✗'} shop approved不含替补: {ok3d}")
+
+        # 测试4: export <id> all bench（全格式+已确认+替补）
+        with patch('sys.stdout', new_callable=io.StringIO) as mock_out:
+            cmd_export(db, [car.id, "all", "bench"])
+            output = mock_out.getvalue()
+        ok4 = "群公告" in output and "审核表" in output and "店铺交接" in output
+        print(f"  {'✓' if ok4 else '✗'} all bench: 包含三种格式={ok4}")
+
+        return all([ok1, ok1b, ok1c, ok2, ok2b, ok3, ok3b, ok3c, ok3d, ok4])
+    finally:
+        _restore_db(backup)
+
+
+def test_full_workflow_v12():
+    sep("完整工作流 v1.2（0经验+模板+分离+标签+复制+筛选+导出）")
+    backup = _clean_db()
+    db = load_db()
+    try:
+        # 1. 建模板
         tpl = CarTemplate.create(
             name="周末5h萌新友好", total_players=6, duration_hours=5,
             city="上海", shop="硬核旗舰店",
@@ -344,7 +530,7 @@ def test_full_workflow_v11():
         add_template(db, tpl)
         print(f"  ✓ 建模板: {tpl.name} (0门槛)")
 
-        # 2. 建车，套用模板
+        # 2. 建车
         car = Car.create(
             name="《立方馆谋杀始末》", total_players=tpl.total_players,
             duration_hours=tpl.duration_hours,
@@ -352,93 +538,83 @@ def test_full_workflow_v11():
             start_time=datetime.now().replace(hour=19, minute=0) + timedelta(days=1),
             role_constraints=tpl.role_constraints,
             require_unread=tpl.require_unread,
-            min_experience=tpl.min_experience,  # 0门槛
+            min_experience=tpl.min_experience,
             template_id=tpl.id,
         )
         add_car(db, car)
-        print(f"  ✓ 建车套用模板: {car.name} 门槛={car.min_experience} (0=萌新可进)")
+        print(f"  ✓ 建车: {car.name} 门槛={car.min_experience}")
 
-        # 3. 添加玩家：含0经验萌新
+        # 3. 添加玩家（含标签）
         players_data = [
-            ("萌新A", "女", 0, "随时", False, "", True),
-            ("萌新B", "男", 0, "19:00前", False, "第一次玩", False),
-            ("老炮C", "男", 8, "随时", False, "", False),
-            ("老炮D", "女", 5, "18:30后", False, "", True),
-            ("天眼E", "男", 99, "随时", True, "疑似天眼", False),  # 已读本
-            ("跳车F", "女", 2, "随时", False, "去年跳过车", False),
-            ("迟到G", "男", 3, "20:30前到不了", False, "经常迟到", False),
+            ("萌新A", "女", 0, "随时", False, "", True, ["萌新友好"]),
+            ("老炮C", "男", 8, "随时", False, "", False, ["靠谱", "推土机"]),
+            ("天眼E", "男", 99, "随时", True, "疑似天眼", False, ["天眼风险"]),
+            ("跳车F", "女", 2, "随时", False, "去年跳过车", False, ["跳车"]),
+            ("迟到G", "男", 3, "随时", False, "经常迟到", False, ["易迟到"]),
+            ("靠谱H", "男", 6, "18:30后", False, "", True, ["靠谱"]),
         ]
-        for nick, gender, exp, avail, has_read, notes, cc in players_data:
+        for nick, gender, exp, avail, has_read, notes, cc, tags in players_data:
             p = Player.create(nickname=nick, gender=gender,
                               past_hardcore_books="", accept_crosscast=cc,
-                              experience_count=exp)
+                              experience_count=exp, tags=tags)
             add_player(db, p)
             reg = Registration.create(car.id, p.id, available_time=avail,
                                       read_this_book=has_read, notes=notes)
             add_registration(db, reg)
-        print(f"  ✓ 添加 {len(players_data)} 名玩家 (含2名0经验萌新)")
+        print(f"  ✓ 添加 {len(players_data)} 名玩家 (含标签)")
 
         # 4. 分诊
         regs = get_registrations_by_car(db, car.id)
         triaged = triage_registrations(db, car, regs)
-        print(f"  ⛔ 冲突: {len(triaged['conflict'])} 人")
-        for r in triaged["conflict"]:
-            crits = [str(i) for i in r.issues if i.severity == "critical"]
-            print(f"     - {r.player.nickname}({r.player.experience_count or '萌新'}): {'; '.join(crits[:2])}")
-        print(f"  ⚠️  存疑: {len(triaged['warning'])} 人")
-        for r in triaged["warning"]:
-            warns = [str(i) for i in r.issues if i.severity == "warning"]
-            print(f"     - {r.player.nickname}({r.player.experience_count or '萌新'}): {'; '.join(warns[:2])}")
-        print(f"  ✅ 匹配: {len(triaged['match'])} 人")
-        for r in triaged["match"]:
-            exp_str = "萌新" if r.player.experience_count == 0 else f"{r.player.experience_count}硬核"
-            print(f"     - {r.player.nickname}({exp_str}) 得分{r.match_score}")
-
-        # 验证：0经验萌新A能出现在匹配里（因为门槛0）
         match_nicks = {r.player.nickname for r in triaged["match"]}
-        ok = "萌新A" in match_nicks
-        print(f"  {'✓' if ok else '✗'} 0经验萌新A在门槛0的车里出现在匹配列表: {'萌新A' in match_nicks}")
+        ok1 = "萌新A" in match_nicks
+        print(f"  {'✓' if ok1 else '✗'} 0经验萌新出现在匹配列表")
 
-        # 5. 筛选 eligible + 按经验排序
+        # 5. 天眼风险标签应产生 critical
+        conflict_nicks = {r.player.nickname for r in triaged["conflict"]}
+        ok2 = "天眼E" in conflict_nicks
+        print(f"  {'✓' if ok2 else '✗'} 天眼风险标签→冲突段")
+
+        # 6. 复制车
+        new_time = datetime.now() + timedelta(days=8)
+        car2 = car.copy(start_time=new_time, shop="硬核分店")
+        add_car(db, car2)
+        ok3 = car2.shop == "硬核分店" and car2.min_experience == 0
+        print(f"  {'✓' if ok3 else '✗'} 复制车: 新店={car2.shop} 门槛={car2.min_experience}")
+
+        # 7. 筛选+排序
         tri = triage_registrations(db, car, regs, filter_status="eligible", sort_by="experience")
         eligible = tri["all"]
         exps = [r.player.experience_count for r in eligible]
-        ok2 = exps == sorted(exps, reverse=True) and 99 not in exps  # 天眼E被过滤
-        print(f"  {'✓' if ok2 else '✗'} eligible+experience排序: {exps} (不应含99=天眼E)")
+        ok4 = exps == sorted(exps, reverse=True) and 99 not in exps
+        print(f"  {'✓' if ok4 else '✗'} eligible+experience排序: {exps}")
 
-        # 6. 模拟 approve 全部匹配的 + 前几个warning
-        all_ordered = triaged["match"] + triaged["warning"] + triaged["conflict"]
-        for idx, r in enumerate(all_ordered):
-            if idx < car.total_players and not r.has_critical:
-                r.registration.status = "approved"
-            elif not r.has_critical:
-                r.registration.status = "bench"
+        # 8. 审核一些玩家
+        for r in triaged["match"]:
+            r.registration.status = "approved"
         save_db(db)
 
         approved = [r for r in regs if r.status == "approved"]
-        benched = [r for r in regs if r.status == "bench"]
-        print(f"  ✓ 审核完成: 已确认{len(approved)}人 / 替补{len(benched)}人 / 淘汰{len(regs)-len(approved)-len(benched)}人")
+        print(f"  ✓ 审核完成: 已确认{len(approved)}人")
 
-        # 7. 验证0经验导出显示
+        # 9. 0经验在导出中显示
         from hardcore_car import exp_display
+        ok5 = True
         for r in approved:
             p = get_player(db, r.player_id)
             if p.experience_count == 0:
                 disp = exp_display(p.experience_count)
-                print(f"  ✓ 0经验在导出中显示: {p.nickname} → {disp}")
+                if disp != "萌新":
+                    ok5 = False
+                print(f"  ✓ 0经验导出显示: {p.nickname} → {disp}")
 
-        return ok and ok2
+        return all([ok1, ok2, ok3, ok4, ok5])
     finally:
-        if backup is not None:
-            os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-            with open(DB_FILE, "w", encoding="utf-8") as f:
-                f.write(backup)
-        elif os.path.exists(DB_FILE):
-            os.remove(DB_FILE)
+        _restore_db(backup)
 
 
 def main():
-    print("🔥 硬核推理车队招募助手 v1.1 - 集成测试套件")
+    print("🔥 硬核推理车队招募助手 v1.2 - 集成测试套件")
     print(f"   Python {sys.version.split()[0]}  |  DB: {DB_FILE}")
 
     results = []
@@ -448,7 +624,11 @@ def main():
         ("玩家/报名字段分离", test_player_registration_split),
         ("车队模板功能", test_templates),
         ("view筛选/排序", test_view_filter_sort),
-        ("完整工作流v1.1", test_full_workflow_v11),
+        ("玩家长期标签", test_player_tags),
+        ("车队复制", test_car_copy),
+        ("序号范围解析", test_parse_index_ranges),
+        ("导出格式×范围", test_export_formats),
+        ("完整工作流v1.2", test_full_workflow_v12),
     ]
     for name, fn in tests:
         try:

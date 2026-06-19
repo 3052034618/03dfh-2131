@@ -772,11 +772,11 @@ def cmd_view(db, args):
         print(color(f"! 该车尚无报名，使用 add {car.id} 添加", "yellow"))
         return
 
-    # 如果没有指定任何参数，先弹一次交互式菜单
     if not any(a.startswith("--") for a in args):
         filter_status, sort_by = _interactive_view_options(filter_status, sort_by)
 
     while True:
+        regs = get_registrations_by_car(db, car.id)
         ordered, sections, triaged = _gather_indexed_players(db, car, regs, filter_status, sort_by)
         total = len(ordered)
         approved_count = len([r for r in regs if r.status == "approved"])
@@ -814,9 +814,14 @@ def cmd_view(db, args):
                 elif reg.status == "bench":
                     status_tag = color(" [⏸替补]", "blue")
                 cc = reg.effective_accept_crosscast(player)
-                print(f"{color(f'[{idx:>2}]', 'bold')} {player.nickname} "
-                      f"({player.gender}·{exp_display(player.experience_count)})"
-                      f"{status_tag}")
+                line = f"{color(f'[{idx:>2}]', 'bold')} {player.nickname} "
+                line += f"({player.gender}·{exp_display(player.experience_count)})"
+                line += status_tag
+                # 长期标签带出
+                td = tags_display(player, max_len=30)
+                if td:
+                    line += f" {td}"
+                print(line)
                 extra_bits = []
                 if cc:
                     extra_bits.append("反串OK")
@@ -836,10 +841,10 @@ def cmd_view(db, args):
         if shown == 0:
             print(color("  （当前筛选下无记录，试试切换筛选条件）", "dim"))
 
-        print(color("快捷操作：数字键切换筛选/排序 · r=刷新 · q=退出当前view", "dim"))
-        print(color(f"          approve/bench/kick {car.id} <序号...>  可在主界面执行", "dim"))
+        print(color("批量审核：a1-3 approve  |  b4,5 bench  |  k6 kick  |  范围: a1-6", "dim"))
+        print(color("切换条件：1-6筛选  a-d排序  |  r刷新  q退出", "dim"))
         try:
-            sel = input(color("\n按回车刷新，或输入选项> ", "cyan")).strip().lower()
+            sel = input(color("操作> ", "cyan")).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -849,12 +854,83 @@ def cmd_view(db, args):
             break
         if sel == "r":
             continue
-        # 切换筛选/排序
-        prev_f, prev_s = filter_status, sort_by
-        filter_status, sort_by = _interactive_view_options(filter_status, sort_by)
-        if (prev_f, prev_s) == (filter_status, sort_by) and sel not in ("1", "2", "3", "4", "5", "6", "a", "b", "c", "d"):
-            # 如果不是选项命令，也没有变化，退出交互
-            break
+
+        # 解析 a/b/k + 序号 的内联审核命令
+        action = None
+        idx_text = sel
+        if sel[0] in ("a", "ａ"):
+            action = "approve"
+            idx_text = sel[1:]
+        elif sel[0] in ("b", "ｂ"):
+            action = "bench"
+            idx_text = sel[1:]
+        elif sel[0] in ("k", "ｋ"):
+            action = "kick"
+            idx_text = sel[1:]
+
+        if action and idx_text:
+            targets = parse_index_ranges(idx_text)
+            if not targets:
+                print(color("  ! 无有效序号", "red"))
+                continue
+            idx_map = {i: r for i, r in ordered}
+            _apply_bulk_action(db, car, idx_map, targets, action)
+            continue
+
+        # 筛选/排序切换
+        f_map = {"1": "all", "2": "pending", "3": "eligible", "4": "approved", "5": "bench", "6": "conflict"}
+        s_map = {"a": "score", "b": "experience", "c": "time", "d": "created"}
+        changed = False
+        if sel in f_map:
+            filter_status = f_map[sel]
+            changed = True
+        if sel in s_map:
+            sort_by = s_map[sel]
+            changed = True
+        if len(sel) >= 2:
+            if sel[0] in f_map:
+                filter_status = f_map[sel[0]]
+                changed = True
+            if sel[1] in s_map:
+                sort_by = s_map[sel[1]]
+                changed = True
+        if not changed:
+            # 尝试当做交互式选项菜单
+            filter_status, sort_by = _interactive_view_options(filter_status, sort_by)
+
+
+def _apply_bulk_action(db, car, idx_map, targets, action):
+    """在 view 内批量执行 approve/bench/kick"""
+    approved_count = len([r for r in db.registrations
+                          if r.car_id == car.id and r.status == "approved"])
+    for idx in targets:
+        if idx not in idx_map:
+            print(color(f"  ! 序号 {idx} 不在当前列表", "red"))
+            continue
+        mr = idx_map[idx]
+        reg = mr.registration
+        player = mr.player
+        if action == "kick":
+            db.registrations = [r for r in db.registrations if r.id != reg.id]
+            print(color(f"  ✗ 已移除: {player.nickname}", "red"))
+        elif action == "bench":
+            if reg.status == "approved":
+                approved_count -= 1
+            reg.status = "bench"
+            print(color(f"  ⏸ 替补: {player.nickname}", "blue"))
+        elif action == "approve":
+            if approved_count >= car.total_players and reg.status != "approved":
+                print(color(f"  ! {player.nickname} → 自动替补（已达满员{car.total_players}人）", "yellow"))
+                reg.status = "bench"
+            else:
+                if reg.status != "approved":
+                    approved_count += 1
+                reg.status = "approved"
+                print(color(f"  ✓ 确认: {player.nickname}", "green"))
+    save_db(db)
+    if approved_count >= car.total_players and car.status == "open":
+        if prompt_bool(f"  已确认{approved_count}人达到上限，标记为「已满」？", True):
+            update_car_status(db, car.id, "full")
 
 
 def _print_car_header(car):
@@ -1004,6 +1080,9 @@ def cmd_info(db, args):
             print(f"    {i:>2}. {p.nickname} ({p.gender}·{exp_display(p.experience_count)}) "
                   f"· 可到:{reg.available_time} · {'已读本⚠️' if reg.read_this_book else ''} "
                   f"· {'反串OK' if cc else ''} · {st}")
+            td = tags_display(p, max_len=50)
+            if td:
+                print(f"        🏷️ {td}")
             if reg.notes:
                 print(f"        📝 {reg.notes}")
     else:
@@ -1024,126 +1103,390 @@ def cmd_del(db, args):
         print(color(f"✓ 已删除", "green"))
 
 
-def cmd_export(db, args):
+# =====================================================
+#  复制车命令（跨群发车）
+# =====================================================
+
+def cmd_copy(db, args):
     if not args:
-        print(color("! 用法：export <车辆ID>", "red"))
+        print(color("! 用法：copy <车辆ID>", "red"))
+        return
+    src = _get_car_or_error(db, args[0])
+    if not src:
+        return
+
+    print(color(f"\n=== 复制车队 · 源: {src.name} ({src.id}) ===", "bold", "cyan"))
+    print("将从已有车复制配置，可修改时间/店铺/群名，报名记录不复制。\n")
+
+    name = prompt("本名（留空=与源车相同）", default=src.name, required=True)
+    city = prompt("城市", default=src.city, required=True)
+    shop = prompt("店铺（可换不同分店）", default=src.shop, required=True)
+    group_name = prompt("目标群名（如 硬核交流群A / 周末拼车群；可留空）", required=False)
+
+    start_dt = None
+    while start_dt is None:
+        default_time = datetime.now() + timedelta(days=1)
+        default_time = default_time.replace(hour=19, minute=0, second=0, microsecond=0)
+        raw = prompt("开车时间", default=default_time.strftime("%Y-%m-%d 19:00"))
+        ok, result = v_datetime(raw)
+        if ok:
+            start_dt = result
+        else:
+            print(color(f"  ! {result}", "red"))
+
+    total_players = int(prompt("玩家总人数", default=src.total_players, validator=v_int_pos))
+    duration_hours = float(prompt("预计时长（小时）", default=src.duration_hours, validator=v_float_pos))
+    role_constraints = prompt("角色配置", default=src.role_constraints or "", required=False)
+    require_unread = prompt_bool("要求未读本", default=src.require_unread)
+    min_exp = int(prompt("最低经验（0=无门槛）", default=src.min_experience, validator=v_int_nonneg))
+
+    new_car = src.copy(
+        name=name, start_time=start_dt, city=city, shop=shop,
+        total_players=total_players, duration_hours=duration_hours,
+        role_constraints=role_constraints,
+        require_unread=require_unread, min_experience=min_exp,
+    )
+    add_car(db, new_car)
+
+    print(color(f"\n✓ 新车已创建！", "green", "bold"))
+    print(f"  车辆ID: {color(new_car.id, 'yellow', 'bold')}")
+    print(f"  {new_car.name} · {new_car.total_players}人 · {new_car.duration_hours}h")
+    print(f"  时间: {new_car.start_time.strftime('%Y-%m-%d %H:%M')}")
+    print(f"  地点: {new_car.city} · {new_car.shop}")
+    if group_name:
+        print(f"  群: {group_name}")
+    if min_exp > 0:
+        print(f"  门槛: ≥{min_exp}硬核本")
+    else:
+        print(f"  门槛: 无门槛（萌新友好）")
+    print(color(f"\n  添加玩家：add {new_car.id}", "dim"))
+    print(color(f"  生成文案：draft {new_car.id}", "dim"))
+
+    if prompt_bool("\n  保存为模板？", False):
+        tpl_name = prompt("模板名称", required=True)
+        existing = get_template(db, tpl_name)
+        if existing and not prompt_bool(f"模板「{tpl_name}」已存在，覆盖？", False):
+            return new_car
+        if existing:
+            delete_template(db, existing.id)
+        tpl = CarTemplate.create(
+            name=tpl_name, total_players=new_car.total_players,
+            duration_hours=new_car.duration_hours, city=new_car.city, shop=new_car.shop,
+            role_constraints=new_car.role_constraints,
+            require_unread=new_car.require_unread, min_experience=new_car.min_experience,
+        )
+        add_template(db, tpl)
+        print(color(f"✓ 模板已保存：{tpl.name}", "green"))
+
+    return new_car
+
+
+# =====================================================
+#  草稿/文案命令（多群发布）
+# =====================================================
+
+def cmd_draft(db, args):
+    if not args:
+        print(color("! 用法：draft <车辆ID>", "red"))
         return
     car = _get_car_or_error(db, args[0])
     if not car:
         return
+
+    group_name = " ".join(args[1:]) if len(args) > 1 else ""
+    if not group_name:
+        group_name = prompt("目标群名（如 硬核交流群A；可留空）", required=False) or ""
+
+    weekday = ["一", "二", "三", "四", "五", "六", "日"][car.start_time.weekday()]
+    time_str = car.start_time.strftime(f"%m月%d日 周{weekday} %H:%M")
+    end_time = car.start_time + timedelta(hours=car.duration_hours)
+    end_str = end_time.strftime("%H:%M")
+    exp_str = f"≥{car.min_experience}个硬核本经验" if car.min_experience > 0 else "无门槛（萌新友好）"
+    loc_str = f"{car.city}·{car.shop}" if car.city else car.shop
+
+    regs = get_registrations_by_car(db, car.id)
+    approved_count = len([r for r in regs if r.status == "approved"])
+    pending_count = len([r for r in regs if r.status == "pending"])
+    remaining = max(0, car.total_players - approved_count)
+
+    # --- 报名文案（发到群里吸引报名） ---
+    print(color("\n" + "═" * 58, "bold", "cyan"))
+    print(color("  📝 群报名文案（复制到群内发布）", "bold", "cyan"))
+    print(color("═" * 58, "bold", "cyan"))
+
+    group_tag = f"【{group_name}】" if group_name else ""
+    draft_lines = [
+        f"{group_tag}🔥硬核发车🔥",
+        f"📖《{car.name}》",
+        f"⏰ {time_str}～{end_str}（约{car.duration_hours:.0f}h）",
+        f"📍 {loc_str}",
+        f"👥 {car.total_players}人 | {exp_str}",
+    ]
+    if car.role_constraints:
+        draft_lines.append(f"🎭 {car.role_constraints}")
+    if car.require_unread:
+        draft_lines.append("📜 要求全员未读本")
+    draft_lines.append("")
+    if remaining > 0:
+        draft_lines.append(f"✅ 已确认 {approved_count}/{car.total_players}  🔓 还剩 {remaining} 席")
+    else:
+        draft_lines.append(f"✅ 已满员 {approved_count}/{car.total_players}")
+    if pending_count > 0:
+        draft_lines.append(f"⏳ 审核中 {pending_count} 人")
+    draft_lines.append("")
+    draft_lines.append("👇 有意私车头报名，格式：")
+    draft_lines.append("  昵称 / 性别 / 可到时间 / 硬核本数 / 是否反串")
+    for line in draft_lines:
+        print(line)
+
+    # --- 车头私聊登记提示（自己用） ---
+    print(color("\n" + "─" * 58, "dim"))
+    print(color("  🗂️ 车头私聊登记提示（自己记录用）", "bold", "yellow"))
+    print(color("─" * 58, "dim"))
+
+    print(f"\n车: {car.name}  ID: {car.id}  群: {group_name or '未指定'}")
+    print(f"时: {time_str}～{end_str}  地: {loc_str}")
+    print(f"配: {car.total_players}人 {car.role_constraints or ''}  门: {exp_str}")
+    if car.require_unread:
+        print("要: 未读本")
+    print()
+    print("报名登记模板：")
+    print(f"  add {car.id}")
+    print(f"  → 昵称 / 性别 / 可到 / 已读本? / 备注 / 经验 / 反串")
+    if approved_count > 0:
+        print(f"\n当前状态: {approved_count}已确认 / {pending_count}待审 / {car.total_players - approved_count}空位")
+
+    # 自动复制
+    try:
+        full_text = "\n".join(draft_lines)
+        if os.name == "nt":
+            import subprocess
+            p = subprocess.Popen(["clip"], stdin=subprocess.PIPE)
+            p.communicate(full_text.encode("utf-16-le"))
+            print(color("\nℹ️ 报名文案已复制到剪贴板", "green"))
+    except Exception:
+        pass
+
+
+def cmd_export(db, args):
+    if not args:
+        print(color("! 用法：export <车辆ID> [格式] [范围]", "red"))
+        print(color("  格式: all(默认) / notice(群公告) / check(审核表) / shop(店铺表)", "dim"))
+        print(color("  范围: approved(仅已确认) / bench(已确认+替补)", "dim"))
+        print(color("  示例: export ab12 notice approved", "dim"))
+        return
+
+    car_id = args[0]
+    fmt = "all"
+    scope = "bench"  # 默认已确认+替补
+
+    for a in args[1:]:
+        al = a.lower()
+        if al in ("notice", "check", "shop", "all"):
+            fmt = al
+        elif al == "approved":
+            scope = "approved"
+        elif al in ("bench", "all"):
+            scope = "bench"
+
+    car = _get_car_or_error(db, car_id)
+    if not car:
+        return
+
     regs = get_registrations_by_car(db, car.id)
     approved_regs = [r for r in regs if r.status == "approved"]
     benched_regs = [r for r in regs if r.status == "bench"]
     pending_regs = [r for r in regs if r.status == "pending"]
-
-    weekday = ["一", "二", "三", "四", "五", "六", "日"][car.start_time.weekday()]
-    time_str = car.start_time.strftime(f"%Y年%m月%d日 周{weekday} %H:%M")
-    end_time = car.start_time + timedelta(hours=car.duration_hours)
-    end_str = end_time.strftime("%H:%M")
 
     approved_pairs = [(r, get_player(db, r.player_id)) for r in approved_regs]
     approved_pairs = [(r, p) for r, p in approved_pairs if p]
     benched_pairs = [(r, get_player(db, r.player_id)) for r in benched_regs]
     benched_pairs = [(r, p) for r, p in benched_pairs if p]
 
-    # --- 群公告 ---
-    print(color("\n" + "═" * 62, "bold", "cyan"))
-    print(color("  📢 微信群公告（直接复制发送）", "bold", "cyan"))
-    print(color("═" * 62, "bold", "cyan"))
-
-    announcement = []
-    announcement.append(f"【硬核组局公告】《{car.name}》")
-    announcement.append("")
-    announcement.append(f"📅 时间：{time_str} ～ 约{end_str}")
-    announcement.append(f"📍 地点：{car.city} · {car.shop}")
-    announcement.append(f"🎭 人数：{car.total_players}人（硬核推理）")
-    if car.role_constraints:
-        announcement.append(f"🎲 配置：{car.role_constraints}")
-    if car.require_unread:
-        announcement.append(f"📜 要求：全员未读本，严禁天眼 / 剧透")
-    if car.min_experience > 0:
-        announcement.append(f"💪 门槛：需≥{car.min_experience}个硬核本经验")
+    # 根据 scope 决定包含范围
+    if scope == "approved":
+        included_pairs = approved_pairs
+        included_bench = []
     else:
-        announcement.append(f"💪 门槛：无（萌新友好）")
-    announcement.append("")
+        included_pairs = approved_pairs
+        included_bench = benched_pairs
 
-    if approved_pairs:
-        announcement.append("✅ 已确认名单（按到场先后排序）：")
+    weekday = ["一", "二", "三", "四", "五", "六", "日"][car.start_time.weekday()]
+    time_str = car.start_time.strftime(f"%Y年%m月%d日 周{weekday} %H:%M")
+    end_time = car.start_time + timedelta(hours=car.duration_hours)
+    end_str = end_time.strftime("%H:%M")
+    loc_str = f"{car.city}·{car.shop}"
+    exp_str = f"≥{car.min_experience}个硬核本经验" if car.min_experience > 0 else "无门槛（萌新友好）"
+
+    all_text_parts = []
+
+    # ============ 格式1: 群公告 (notice) ============
+    if fmt in ("all", "notice"):
+        print(color("\n" + "═" * 62, "bold", "cyan"))
+        print(color("  📢 微信群公告", "bold", "cyan"))
+        print(color("═" * 62, "bold", "cyan"))
+
+        announcement = []
+        announcement.append(f"【硬核组局公告】《{car.name}》")
+        announcement.append("")
+        announcement.append(f"📅 时间：{time_str} ～ 约{end_str}")
+        announcement.append(f"📍 地点：{loc_str}")
+        announcement.append(f"🎭 人数：{car.total_players}人（硬核推理）")
+        if car.role_constraints:
+            announcement.append(f"🎲 配置：{car.role_constraints}")
+        if car.require_unread:
+            announcement.append(f"📜 要求：全员未读本，严禁天眼 / 剧透")
+        announcement.append(f"💪 门槛：{exp_str}")
+        announcement.append("")
+
+        if approved_pairs:
+            announcement.append("✅ 已确认名单：")
+            for i, (r, p) in enumerate(approved_pairs, 1):
+                tag = ""
+                cc = r.effective_accept_crosscast(p)
+                if cc and (
+                    (car.role_constraints and "男" in car.role_constraints and p.gender == "女") or
+                    (car.role_constraints and "女" in car.role_constraints and p.gender == "男")
+                ):
+                    tag = "（反串）"
+                gender_icon = "♂" if p.gender == "男" else "♀"
+                exp_tag = f"[萌新]" if p.experience_count <= 0 else ""
+                announcement.append(f"  {i}. {gender_icon} {p.nickname}{tag}{exp_tag}")
+        else:
+            announcement.append("⚠️ 尚未确认任何玩家入队！请先用 approve 确认。")
+
+        if scope == "bench" and benched_pairs:
+            announcement.append("")
+            announcement.append("⏳ 替补名单：")
+            for i, (r, p) in enumerate(benched_pairs, 1):
+                announcement.append(f"  {i}. {p.nickname} ({p.gender}·{exp_display(p.experience_count)})  可到:{r.available_time}")
+
+        if pending_regs:
+            announcement.append("")
+            announcement.append(f"🔍 待审核：{len(pending_regs)}人（车头私聊中）")
+
+        announcement.append("")
+        announcement.append("━" * 42)
+        announcement.append("📌 【重要提醒】")
+        announcement.append(f"  1. 💰 付款截止：请于 {car.start_time.strftime('%m月%d日 12:00')} 前付定金锁位")
+        announcement.append("     （定金不退，可自行找人顶位）")
+        announcement.append("  2. ⏰ 迟到处理：迟到15分钟以上请主动给大家买奶茶/小吃")
+        announcement.append("     迟到超30分钟定金扣除，座位顺延给替补")
+        announcement.append("  3. 🤫 禁剧透：结束前禁止在群内外透露任何剧情、手法、凶手")
+        announcement.append("     违者永久拉黑！")
+        announcement.append("  4. 🚫 跳车处理：开场前24小时内跳车，定金不退+群内公示")
+        announcement.append("━" * 42)
+        announcement.append("")
+        announcement.append("📣 收到请回复【确认】，有事随时私车头！")
+        announcement.append("祝大家盘得开心，凶手自投！🔥🎯")
+
+        for line in announcement:
+            print(line)
+        all_text_parts.extend(announcement)
+
+    # ============ 格式2: 车头审核表 (check) ============
+    if fmt in ("all", "check"):
+        print(color("\n" + "─" * 62, "dim"))
+        print(color("  📋 车头审核表（内部用）", "bold", "yellow"))
+        print(color("─" * 62, "dim"))
+
+        print(color(f"\n{'#':<3}{'昵称':<12}{'性别':<4}{'经验':<8}{'反串':<4}{'可到':<12}{'定金':<4}{'备注'}", "bold"))
+        print("-" * 78)
         for i, (r, p) in enumerate(approved_pairs, 1):
-            tag = ""
-            cc = r.effective_accept_crosscast(p)
-            if cc and (
-                (car.role_constraints and "男" in car.role_constraints and p.gender == "女") or
-                (car.role_constraints and "女" in car.role_constraints and p.gender == "男")
-            ):
-                tag = "（反串）"
-            gender_icon = "♂" if p.gender == "男" else "♀"
-            announcement.append(f"  {i}. {gender_icon} {p.nickname}{tag}")
-    else:
-        announcement.append(color("⚠️ 尚未确认任何玩家入队！请先用 approve 确认。", "yellow"))
+            exp_s = exp_display(p.experience_count)
+            cc_s = "✓" if r.effective_accept_crosscast(p) else "✗"
+            note = r.notes[:20] if r.notes else ""
+            if r.read_this_book:
+                note = ("⚠已读本 " + note)[:20]
+            # 长期标签中的风险信息
+            risk = p.risk_tags()
+            if risk:
+                note = (note + " " + "⚠".join(risk))[:20]
+            print(f"{i:<3}{p.nickname[:10]:<12}{p.gender:<4}{exp_s:<8}{cc_s:<4}"
+                  f"{r.available_time[:10]:<12}{'□':<4}{note}")
 
-    if benched_pairs:
-        announcement.append("")
-        announcement.append("⏳ 替补名单：")
-        for i, (r, p) in enumerate(benched_pairs, 1):
-            announcement.append(f"  {i}. {p.nickname} ({p.gender}·{exp_display(p.experience_count)})  可到:{r.available_time}")
+        if scope == "bench" and benched_pairs:
+            print(color(f"\n── 替补席 ──", "blue", "bold"))
+            for i, (r, p) in enumerate(benched_pairs, 1):
+                risk_note = ""
+                rt = p.risk_tags()
+                if rt:
+                    risk_note = f" ⚠{'⚠'.join(rt)}"
+                print(f"  B{i}. {p.nickname} ({p.gender}·{exp_display(p.experience_count)})  "
+                      f"可到:{r.available_time}  {r.notes or ''}{risk_note}")
 
-    if pending_regs:
-        announcement.append("")
-        announcement.append(f"🔍 待审核：{len(pending_regs)}人（车头私聊中）")
+        if pending_regs:
+            print(color(f"\n── 待审核: {len(pending_regs)}人 ──", "yellow", "bold"))
+            pending_pairs = [(r, get_player(db, r.player_id)) for r in pending_regs]
+            for r, p in pending_pairs:
+                if p:
+                    risk_note = ""
+                    rt = p.risk_tags()
+                    if rt:
+                        risk_note = f" ⚠{'/⚠'.join(rt)}"
+                    print(f"  ? {p.nickname} ({p.gender}·{exp_display(p.experience_count)})  "
+                          f"可到:{r.available_time}{risk_note}")
 
-    announcement.append("")
-    announcement.append("━" * 42)
-    announcement.append("📌 【重要提醒】")
-    announcement.append(f"  1. 💰 付款截止：请于 {car.start_time.strftime('%m月%d日 12:00')} 前付定金锁位")
-    announcement.append("     （定金不退，可自行找人顶位）")
-    announcement.append("  2. ⏰ 迟到处理：迟到15分钟以上请主动给大家买奶茶/小吃")
-    announcement.append("     迟到超30分钟定金扣除，座位顺延给替补")
-    announcement.append("  3. 🤫 禁剧透：结束前禁止在群内外透露任何剧情、手法、凶手")
-    announcement.append("     违者永久拉黑！")
-    announcement.append("  4. 🚫 跳车处理：开场前24小时内跳车，定金不退+群内公示")
-    announcement.append("━" * 42)
-    announcement.append("")
-    announcement.append("📣 收到请回复【确认】，有事随时私车头！")
-    announcement.append("祝大家盘得开心，凶手自投！🔥🎯")
+        check_lines = []
+        all_text_parts.append("")
+        all_text_parts.extend(check_lines)
 
-    for line in announcement:
-        print(line)
+    # ============ 格式3: 店铺交接表 (shop) ============
+    if fmt in ("all", "shop"):
+        print(color("\n" + "─" * 62, "dim"))
+        print(color("  🏪 店铺交接表（给店家看）", "bold", "green"))
+        print(color("─" * 62, "dim"))
 
-    # --- 车头清单 ---
-    print(color("\n" + "─" * 62, "dim"))
-    print(color("  📋 车头确认清单（内部用）", "bold", "yellow"))
-    print(color("─" * 62, "dim"))
+        print(f"\n  本名: 《{car.name}》")
+        print(f"  时间: {time_str} ～ {end_str}")
+        print(f"  地点: {loc_str}")
+        print(f"  人数: {len(included_pairs)}人（满员{car.total_players}人）")
+        print(f"  时长: 约{car.duration_hours:.0f}小时")
+        if car.min_experience > 0:
+            print(f"  门槛: ≥{car.min_experience}硬核本经验")
+        else:
+            print(f"  门槛: 无门槛（含萌新）")
+        if car.require_unread:
+            print(f"  要求: 全员未读本")
+        print()
+        print(color(f"  {'#':<3}{'昵称':<12}{'性别':<4}{'经验':<8}{'可到时间':<14}{'备注'}", "bold"))
+        print("  " + "-" * 56)
+        for i, (r, p) in enumerate(included_pairs, 1):
+            exp_s = exp_display(p.experience_count)
+            note_parts = []
+            if r.read_this_book:
+                note_parts.append("已读本")
+            if r.notes:
+                note_parts.append(r.notes[:10])
+            rt = p.risk_tags()
+            if rt:
+                note_parts.append("⚠" + "/".join(rt))
+            note_str = " ".join(note_parts) if note_parts else ""
+            print(f"  {i:<3}{p.nickname[:10]:<12}{p.gender:<4}{exp_s:<8}"
+                  f"{r.available_time[:12]:<14}{note_str}")
 
-    print(color(f"\n{'序号':<4}{'昵称':<14}{'性别':<4}{'经验':<8}{'反串':<4}{'可到时间':<14}{'定金':<4}{'备注'}", "bold"))
-    print("-" * 78)
-    for i, (r, p) in enumerate(approved_pairs, 1):
-        exp_str = exp_display(p.experience_count)
-        cc_str = "✓" if r.effective_accept_crosscast(p) else "✗"
-        note = r.notes[:16] if r.notes else ""
-        if r.read_this_book:
-            note = ("⚠️已读本 " + note)[:16]
-        print(f"{i:<4}{p.nickname[:12]:<14}{p.gender:<4}{exp_str:<8}{cc_str:<4}"
-              f"{r.available_time[:12]:<14}{'□':<4}{note}")
-    if benched_pairs:
-        print(color(f"\n── 替补席 ──", "blue", "bold"))
-        for i, (r, p) in enumerate(benched_pairs, 1):
-            print(f"  B{i}. {p.nickname} ({p.gender}·{exp_display(p.experience_count)})  "
-                  f"可到:{r.available_time}  {r.notes or ''}")
+        if scope == "bench" and benched_pairs:
+            print(f"\n  替补: {len(benched_pairs)}人")
+            for i, (r, p) in enumerate(benched_pairs, 1):
+                print(f"    B{i}. {p.nickname} ({p.gender}) 可到:{r.available_time}")
+
+        print(f"\n  合计到场: {len(included_pairs)}人" +
+              (f" + 替补: {len(included_bench)}人" if included_bench else ""))
+        print(f"  预计散场: 约{end_str}")
 
     print()
-    try:
-        full_text = "\n".join(announcement)
-        if os.name == "nt":
-            try:
+
+    # 自动复制（仅群公告部分）
+    if fmt in ("all", "notice") and all_text_parts:
+        try:
+            full_text = "\n".join(all_text_parts)
+            if os.name == "nt":
                 import subprocess
                 p = subprocess.Popen(["clip"], stdin=subprocess.PIPE)
                 p.communicate(full_text.encode("utf-16-le"))
-                print(color("ℹ️ 公告已自动复制到系统剪贴板，直接 Ctrl+V 粘到群里即可！", "green"))
-            except Exception as e:
-                print(color(f"ℹ️ 自动复制失败（{e}），请手动选中上方公告复制", "dim"))
-    except Exception:
-        pass
+                print(color("ℹ️ 群公告已复制到剪贴板，Ctrl+V 粘到群里即可！", "green"))
+        except Exception:
+            pass
 
 
 def cmd_help(db, args):
@@ -1152,10 +1495,12 @@ def cmd_help(db, args):
 
 COMMANDS = {
     "new": cmd_new, "create": cmd_new,
+    "copy": cmd_copy, "cp": cmd_copy,
     "add": cmd_add, "join": cmd_add,
     "view": cmd_view, "show": cmd_view,
     "export": cmd_export,
     "list": cmd_list, "ls": cmd_list,
+    "draft": cmd_draft,
     "status": cmd_status,
     "approve": lambda db, args: cmd_approve(db, args),
     "confirm": lambda db, args: cmd_approve(db, args),
@@ -1166,7 +1511,8 @@ COMMANDS = {
     "info": cmd_info, "detail": cmd_info,
     "del": cmd_del, "delete": cmd_del, "rm": cmd_del,
     "players": cmd_players,
-    "template": cmd_template, "tpl": cmd_template, "t": cmd_template,
+    "tag": cmd_tag,
+    "template": cmd_template, "tpl": cmd_template,
     "help": cmd_help, "?": cmd_help, "h": cmd_help,
 }
 
